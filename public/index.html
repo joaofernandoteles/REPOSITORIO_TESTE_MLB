@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MLB Dashboard (multi-user)</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 16px; }
+    header { display:flex; gap:8px; align-items:center; margin-bottom:16px; }
+    button, input { padding:8px 10px; font-size:14px; }
+    .row { display:flex; gap:8px; flex-wrap:wrap; margin: 8px 0; }
+    table { border-collapse: collapse; width: 100%; margin-top: 12px; }
+    th, td { border: 1px solid #ddd; padding: 8px; font-size: 13px; }
+    th { background:#f4f4f4; position: sticky; top: 0; }
+    .tag { background:#eef; border:1px solid #cce; padding:2px 6px; border-radius: 6px; font-size:12px; }
+    .card { border:1px solid #eee; padding:12px; border-radius:10px; margin-bottom:12px; }
+    .ok { background:#e8ffe8; }
+    .warn { background:#fff5e6; }
+  </style>
+</head>
+<body>
+  <header>
+    <h2 style="margin:0">MLB Dashboard</h2>
+    <span id="authState" class="tag">desconectado</span>
+    <button id="btnLogout" style="display:none;">Sair</button>
+  </header>
+
+  <section class="card warn" id="setupCard">
+    <h3>Configurar credenciais (cada usuário)</h3>
+    <div class="row">
+      <input id="clientId" placeholder="Client ID do app (Mercado Libre Developers)" style="min-width:320px" />
+      <input id="clientSecret" placeholder="Client Secret do app" style="min-width:320px" />
+    </div>
+    <div class="row">
+      <input id="redirectUri" placeholder="Redirect URI (auto-sugerido)" style="min-width:420px" />
+    </div>
+    <div class="row">
+      <button id="btnSaveSetup">Salvar & Conectar</button>
+    </div>
+    <small>Use exatamente a mesma URI cadastrada no seu app. Sugestão automática abaixo.</small>
+    <div class="tag" id="suggest">sugestão: …</div>
+  </section>
+
+  <section class="card ok" id="readyCard" style="display:none;">
+    <div class="row" style="justify-content:space-between; align-items:center;">
+      <div>
+        <h3 style="margin:0;">Pronto para usar</h3>
+        <div id="readyMsg" class="tag">—</div>
+      </div>
+      <a href="/authorize"><button>Conectar ao Mercado Livre</button></a>
+    </div>
+  </section>
+
+  <section class="card">
+    <h3>Meus anúncios</h3>
+    <div class="row">
+      <button id="btnMyItems">Carregar meus anúncios</button>
+      <button id="btnExport">Exportar CSV (tabela abaixo)</button>
+    </div>
+  </section>
+
+  <section class="card">
+    <h3>Concorrentes</h3>
+    <div class="row">
+      <input id="sellerId" placeholder="seller_id do concorrente" />
+      <input id="maxSeller" placeholder="máx itens (ex.: 200)" />
+      <button id="btnSellerItems">Buscar por seller_id</button>
+    </div>
+    <div class="row">
+      <input id="q" placeholder="palavra-chave (ex.: palmilha)" />
+      <input id="maxQ" placeholder="máx itens (ex.: 100)" />
+      <button id="btnSearch">Buscar por palavra-chave</button>
+    </div>
+  </section>
+
+  <section>
+    <h3>Resultados</h3>
+    <div style="overflow:auto; max-height: 70vh; border:1px solid #eee">
+      <table id="tbl"><thead></thead><tbody></tbody></table>
+    </div>
+  </section>
+
+<script>
+const API = window.location.origin;
+const $ = sel => document.querySelector(sel);
+const tbl = {
+  set(rows) {
+    const thead = $('#tbl thead');
+    const tbody = $('#tbl tbody');
+    tbody.innerHTML = thead.innerHTML = '';
+    if (!rows || !rows.length) return;
+    const cols = Object.keys(rows[0]);
+    thead.innerHTML = '<tr>' + cols.map(c => `<th>${c}</th>`).join('') + '</tr>';
+    tbody.innerHTML = rows.map(r => '<tr>' + cols.map(c => `<td>${formatCell(r[c])}</td>`).join('') + '</tr>').join('');
+  }
+};
+function formatCell(v){
+  if (v == null) return '';
+  if (typeof v === 'object') return JSON.stringify(v);
+  if (String(v).startsWith('http')) return `<a href="${v}" target="_blank">link</a>`;
+  return String(v);
+}
+function toCSV(rows){
+  if (!rows?.length) return '';
+  const cols = Object.keys(rows[0]);
+  const esc = s => '"' + String(s).replaceAll('"', '""') + '"';
+  const header = cols.map(esc).join(',');
+  const body = rows.map(r => cols.map(c => esc(r[c] ?? '')).join(',')).join('\n');
+  return header + '\n' + body;
+}
+function saveCSV(name, rows){
+  const blob = new Blob([toCSV(rows)], {type:'text/csv;charset=utf-8;'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = name; a.click();
+  URL.revokeObjectURL(url);
+}
+
+async function fetchJSON(url, opts){
+  const r = await fetch(url, opts);
+  if (!r.ok) throw new Error('HTTP '+r.status);
+  return r.json();
+}
+
+function suggestRedirect(){
+  const sug = API + '/oauth/callback';
+  $('#suggest').textContent = 'sugestão: ' + sug;
+  if (!$('#redirectUri').value) $('#redirectUri').value = sug;
+}
+
+async function refreshState(){
+  suggestRedirect();
+  try {
+    const s = await fetchJSON('/api/session');
+    if (s.creds_set) {
+      $('#setupCard').style.display = 'none';
+      $('#readyCard').style.display = 'block';
+      $('#readyMsg').textContent = 'Redirect URI: ' + (s.redirect_uri || '-');
+    } else {
+      $('#setupCard').style.display = 'block';
+      $('#readyCard').style.display = 'none';
+    }
+    if (s.authed) {
+      $('#authState').textContent = 'logado';
+      $('#authState').classList.add('ok');
+      $('#btnLogout').style.display = 'inline-block';
+    } else {
+      $('#authState').textContent = 'desconectado';
+      $('#authState').classList.remove('ok');
+      $('#btnLogout').style.display = 'none';
+    }
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+$('#btnSaveSetup').onclick = async () => {
+  const client_id = $('#clientId').value.trim();
+  const client_secret = $('#clientSecret').value.trim();
+  const redirect_uri = $('#redirectUri').value.trim();
+  if (!client_id || !client_secret || !redirect_uri) return alert('Preencha todos os campos');
+  try {
+    await fetchJSON('/api/setup', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ client_id, client_secret, redirect_uri }) });
+    await refreshState();
+    location.href = '/authorize';
+  } catch (e) {
+    alert('Falha ao salvar credenciais: ' + e.message);
+  }
+};
+
+$('#btnLogout').onclick = async () => {
+  await fetchJSON('/api/logout', { method:'POST' });
+  await refreshState();
+  alert('Sessão limpa.');
+};
+
+$('#btnMyItems').onclick = async () => {
+  try {
+    const rows = await fetchJSON('/api/me/items');
+    const mapped = rows.map(b => ({
+      id: b.id, title: b.title, price: b.price, original_price: b.original_price, sold_quantity: b.sold_quantity,
+      available_quantity: b.available_quantity, listing_type_id: b.listing_type_id, status: b.status, permalink: b.permalink, last_updated: b.last_updated
+    }));
+    tbl.set(mapped);
+    window.__rows = mapped;
+  } catch(e){ alert('Falha ao carregar: ' + e.message + '\nVocê já conectou/autorizou?'); }
+};
+
+$('#btnSellerItems').onclick = async () => {
+  const sid = $('#sellerId').value.trim();
+  const max = $('#maxSeller').value.trim() || '200';
+  if(!sid) return alert('Informe o seller_id');
+  try {
+    const arr = await fetchJSON(`/api/seller/${encodeURIComponent(sid)}/items?max=${encodeURIComponent(max)}`);
+    const mapped = (arr||[]).map(x => ({
+      id: x.id, title: x.title, price: x.price, sold_quantity: x.sold_quantity, listing_type_id: x.listing_type_id,
+      free_shipping: x?.shipping?.free_shipping || false, seller_id: x?.seller?.id, permalink: x.permalink
+    }));
+    tbl.set(mapped); window.__rows = mapped;
+  } catch(e){ alert('Falha: ' + e.message); }
+};
+
+$('#btnSearch').onclick = async () => {
+  const q = $('#q').value.trim(); const max = $('#maxQ').value.trim() || '100';
+  if(!q) return alert('Digite uma palavra-chave');
+  try {
+    const arr = await fetchJSON(`/api/search?q=${encodeURIComponent(q)}&max=${encodeURIComponent(max)}`);
+    const mapped = (arr||[]).map(x => ({
+      id: x.id, title: x.title, price: x.price, sold_quantity: x.sold_quantity, listing_type_id: x.listing_type_id,
+      free_shipping: x?.shipping?.free_shipping || false, seller_id: x?.seller?.id, permalink: x.permalink
+    }));
+    tbl.set(mapped); window.__rows = mapped;
+  } catch(e){ alert('Falha: ' + e.message); }
+};
+
+$('#btnExport').onclick = () => {
+  if (!window.__rows?.length) return alert('Nada para exportar');
+  saveCSV('mlb_resultados.csv', window.__rows);
+};
+
+refreshState();
+</script>
+</body>
+</html>

@@ -174,8 +174,20 @@ const clearSession = req => req.session = null;
 
 // token da aplicação (client_credentials) para chamadas públicas
 async function getAppToken(req) {
-  const creds = getCreds(req);
-  if (!creds) throw new Error('Missing client setup');
+  // tenta pegar da sessão…
+  let creds = getCreds(req);
+
+  // …ou das variáveis de ambiente (plano B)
+  const envId = process.env.APP_CLIENT_ID || process.env.CLIENT_ID;
+  const envSecret = process.env.APP_CLIENT_SECRET || process.env.CLIENT_SECRET;
+  if ((!creds || !creds.client_id || !creds.client_secret) && envId && envSecret) {
+    creds = { client_id: envId, client_secret: envSecret };
+  }
+
+  if (!creds || !creds.client_id || !creds.client_secret) {
+    throw new Error('no_app_credentials'); // sem credenciais; não dá para pedir app token
+  }
+
   const now = Date.now();
   const appTok = req.session?.app_token;
   if (appTok && now < appTok.expires_at) return appTok.access_token;
@@ -191,6 +203,7 @@ async function getAppToken(req) {
   req.session.app_token = { access_token: data.access_token, expires_at };
   return data.access_token;
 }
+
 
 async function exchangeCodeForTokens(req, code) {
   const creds = getCreds(req);

@@ -128,34 +128,66 @@ async function scrapeSellerItems(sellerId, max = 100) {
 
 // Busca via API oficial (com fallback a app token) e padroniza o formato do Passo 8
 // Usa SEMPRE o token de USUÁRIO (OAuth) e ainda envia também como query param
+// Busca itens do seller via API oficial, tentando primeiro TOKEN DE USUÁRIO,
+// e se der 401/403, tenta automaticamente com APP TOKEN (client_credentials).
 async function fetchSellerViaApi(req, sellerId, max = 100) {
   const cap = Math.min(Number(max) || 100, 1000);
-  const token = await refreshIfNeeded(req);              // garante token do usuário
   let offset = 0;
   const all = [];
 
+  // tenta obter token de usuário; se não tiver, segue sem (tentará app token)
+  let userToken = null;
+  try { userToken = await refreshIfNeeded(req); } catch (_) {}
+
   while (all.length < cap) {
-    const params = {
-      seller_id: sellerId,
-      limit: Math.min(50, cap - all.length),
-      offset,
-      access_token: token                                // manda tb na query
-    };
-    const headers = {
-      'Accept': 'application/json',
-      'Authorization': `Bearer ${token}`                 // e no header
-    };
-
+    const limit = Math.min(50, cap - all.length);
     const url = 'https://api.mercadolibre.com/sites/MLB/search';
-    const resp = await axios.get(url, { params, headers });
-    const arr = resp?.data?.results || [];
-    if (!arr.length) break;
+    const baseParams = { seller_id: sellerId, limit, offset };
 
+    let data = null;
+    let lastErr = null;
+
+    // 1) tenta com token de USUÁRIO (header + query)
+    if (userToken) {
+      try {
+        const r = await axios.get(url, {
+          params: { ...baseParams, access_token: userToken },
+          headers: { 'Accept': 'application/json', 'Authorization': `Bearer ${userToken}` },
+          timeout: 20000
+        });
+        data = r.data;
+      } catch (e) {
+        lastErr = e;
+        const s = e.response?.status;
+        // se não for erro de auth, propaga
+        if (s !== 401 && s !== 403) throw e;
+      }
+    }
+
+    // 2) se falhou/sem dados, tenta APP TOKEN (client_credentials)
+    if (!data) {
+      const appTok = await getAppToken(req); // usa credenciais da sessão ou das env vars (se você adicionou)
+      try {
+        const r2 = await axios.get(url, {
+          params: { ...baseParams, access_token: appTok },
+          headers: { 'Accept': 'application/json', 'Authorization': `Bearer ${appTok}` },
+          timeout: 20000
+        });
+        data = r2.data;
+      } catch (e2) {
+        // log para debug e propaga
+        console.error('fetchSellerViaApi fail', e2.response?.status, e2.response?.data || e2.message);
+        throw e2;
+      }
+    }
+
+    const arr = data?.results || [];
+    if (!arr.length) break;
     all.push(...arr);
     offset += arr.length;
   }
 
-  // normaliza pro mesmo formato do Passo 8
+  // normaliza para o formato do "Passo 8"
   return all.map(x => ({
     id: x.id,
     title: x.title,
@@ -164,6 +196,7 @@ async function fetchSellerViaApi(req, sellerId, max = 100) {
     permalink: x.permalink
   }));
 }
+
 
 
 

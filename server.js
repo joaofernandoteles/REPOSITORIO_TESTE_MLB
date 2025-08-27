@@ -535,40 +535,53 @@ app.get('/api/scrape/seller/:sellerId', async (req, res) => {
   try {
     const sellerId = req.params.sellerId;
     const max = Math.min(parseInt(req.query.max || '100', 10), 300);
+
     if (!/^\d{6,}$/.test(sellerId)) {
       return res.status(400).json({ error: 'invalid_seller_id' });
     }
 
-    // 1) tenta raspar a vitrine (_CustId_)
     let rows = [];
+
+    // --- ESTRATÉGIA CORRIGIDA ---
+
+    // 1) Tenta usar a API oficial primeiro. É o método mais confiável.
+    //    A função fetchSellerViaApi já tenta usar o token de usuário e, se falhar,
+    //    usa o token da aplicação (client_credentials).
     try {
-      rows = await scrapeSellerItems(sellerId, max);
+      console.log(`Tentando buscar vendedor ${sellerId} via API oficial.`);
+      rows = await fetchSellerViaApi(req, sellerId, max);
     } catch (e) {
-      console.warn('scrape vitrine falhou, tentando perfil:', e?.response?.status || e.message);
+      console.warn('Busca via API oficial falhou. Tentando fallback para scraping.', e.message);
+      // Se a API falhar (o que não deveria ser comum), podemos tentar o scraping.
     }
 
-    // 2) se veio vazio, tenta pelo perfil do vendedor (precisa nickname)
+    // 2) Se a API não retornou nada (ou falhou), tenta o scraping como ÚLTIMO RECURSO.
     if (!rows.length) {
-      const nickname = await getSellerNickname(req, sellerId);
-      if (nickname) {
-        try {
-          rows = await scrapeSellerByNickname(req, nickname, max);
-        } catch (e) {
-          console.warn('scrape perfil falhou, tentando API:', e?.response?.status || e.message);
-        }
+      try {
+        console.log(`API não retornou dados. Tentando scraping da vitrine para o vendedor ${sellerId}.`);
+        rows = await scrapeSellerItems(sellerId, max);
+      } catch (e) {
+        console.error('Fallback para scraping também falhou.', e.message);
+        // Se o scraping também falhar, aí sim retornamos o erro.
+        // O erro original provavelmente virá da falha da API, que é mais informativo.
+        throw new Error('Tanto a API oficial quanto o scraping falharam em obter os itens do vendedor.');
       }
     }
 
-    // 3) se ainda vazio, cai para API oficial com token de usuário
+    // Se mesmo após o scraping não houver dados, pode ser que o vendedor não tenha itens.
     if (!rows.length) {
-      const viaApi = await fetchSellerViaApi(req, sellerId, max); // sua função atual
-      return res.json(viaApi);
+        console.log(`Nenhum item encontrado para o vendedor ${sellerId} após todas as tentativas.`);
     }
 
     return res.json(rows);
+
   } catch (e) {
-    console.error('seller hybrid error', e?.response?.status, e?.response?.data || e.message);
-    res.status(500).json({ error: 'seller_hybrid_failed', detail: e?.response?.data || e.message });
+    // Loga o erro final para depuração no servidor
+    console.error('Erro final na rota /api/scrape/seller:', e?.response?.data || e.message);
+    res.status(500).json({
+      error: 'seller_hybrid_failed',
+      detail: e?.response?.data || { message: e.message }
+    });
   }
 });
 

@@ -22,7 +22,6 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 // ==== RASPAGEM (HTML) SEM TOKEN — "Passo 8" ====
-import crypto from 'crypto'; // (se já tiver lá, ignore)
 
 // Headers p/ parecer navegador
 const UA_HEADERS = {

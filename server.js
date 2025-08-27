@@ -73,7 +73,7 @@ function parseProductFromHtml(html, id) {
           permalink = permalink || obj.url || '';
         }
       }
-    } catch {}
+    } catch { }
   }
 
   // 2) sold_quantity em JSON interno
@@ -134,7 +134,7 @@ async function fetchSellerViaApi(req, sellerId, max = 100) {
   while (all.length < cap) {
     const resp = await meliGET(req, '/sites/MLB/search', {
       params: { seller_id: sellerId, limit: Math.min(50, cap - all.length), offset },
-      auth: false // tenta público; se 401/403 meliGET já repete com app token
+      auth: true   // usa o token de USUÁRIO (OAuth)
     });
     const arr = resp?.results || [];
     if (!arr.length) break;
@@ -278,7 +278,7 @@ async function meliGET(req, endpoint, { params = {}, auth = false } = {}) {
 
 
 // Rotas utilitárias
-app.get('/api/ping', (req,res)=>res.json({ ok:true, time:Date.now(), prod: IS_PROD }));
+app.get('/api/ping', (req, res) => res.json({ ok: true, time: Date.now(), prod: IS_PROD }));
 app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
 // Sessão/Setup
@@ -301,7 +301,7 @@ app.post('/api/setup', (req, res) => {
   res.json({ ok: true });
 });
 
-app.post('/api/logout', (req, res) => { clearSession(req); res.json({ ok:true }); });
+app.post('/api/logout', (req, res) => { clearSession(req); res.json({ ok: true }); });
 
 // OAuth
 app.get('/authorize', (req, res) => {
@@ -335,7 +335,7 @@ app.get('/oauth/callback', async (req, res) => {
 
 // APIs
 app.get('/api/me', async (req, res) => {
-  try { res.json(await meliGET(req, '/users/me', { auth:true })); }
+  try { res.json(await meliGET(req, '/users/me', { auth: true })); }
   catch (e) { res.status(401).json({ error: 'me_failed', detail: e.response?.data || e.message }); }
 });
 

@@ -291,6 +291,73 @@ async function meliGET(req, endpoint, { params = {}, auth = false } = {}) {
   }
 }
 
+// pega nickname do seller (usa seu token de usuário)
+async function getSellerNickname(req, sellerId) {
+  try {
+    const data = await meliGET(req, `/users/${sellerId}`, { auth: true });
+    return data?.nickname || null;
+  } catch (e) {
+    console.warn('nickname fail', e?.response?.status || e.message);
+    return null;
+  }
+}
+
+// extrai IDs de possíveis JSONs embutidos no perfil
+function extractIdsFromProfileHtml(html) {
+  const ids = new Set();
+
+  // 1) pegue qualquer MLB... que apareça no HTML
+  const re = /MLB-?\d{6,}/g;
+  let m;
+  while ((m = re.exec(html))) {
+    const id = canonicalMlbId(m[0]);
+    if (id) ids.add(id);
+  }
+
+  // 2) pegue de trechos JSON (ex.: "id":"MLB123...")
+  const reJsonId = /"id"\s*:\s*"MLB(\d{6,})"/g;
+  while ((m = reJsonId.exec(html))) {
+    ids.add('MLB' + m[1]);
+  }
+
+  // 3) pegue de "permalink":"https://produto.mercadolivre.com.br/MLB..."
+  const rePerm = /"permalink"\s*:\s*"https?:\/\/[^"]*\/(MLB\d{6,})/g;
+  while ((m = rePerm.exec(html))) {
+    ids.add(m[1]);
+  }
+
+  return Array.from(ids);
+}
+
+// raspa pelo perfil do vendedor usando nickname
+async function scrapeSellerByNickname(req, nickname, max = 100) {
+  const url = `https://www.mercadolivre.com.br/perfil/${encodeURIComponent(nickname)}#search`;
+  const html = await fetchHtml(url);
+  let ids = extractIdsFromProfileHtml(html);
+  if (!ids.length) return [];
+
+  ids = ids.slice(0, Math.min(max, 300));
+  const out = [];
+  const pool = Math.min(6, ids.length);
+  let idx = 0;
+
+  async function worker() {
+    while (idx < ids.length) {
+      const my = ids[idx++];
+      try {
+        const purl = `https://produto.mercadolivre.com.br/${my}`;
+        const h = await fetchHtml(purl);
+        out.push(parseProductFromHtml(h, my));
+      } catch {
+        out.push({ id: my, error: 'fetch_failed' });
+      }
+    }
+  }
+  await Promise.all(Array.from({ length: pool }, () => worker()));
+  return out;
+}
+
+
 
 // Rotas utilitárias
 app.get('/api/ping', (req, res) => res.json({ ok: true, time: Date.now(), prod: IS_PROD }));
@@ -430,29 +497,48 @@ app.get('/api/items', async (req, res) => {
 });
 
 // Rota do "Passo 8" — sem token: raspa a vitrine pública e as páginas dos produtos
+// HÍBRIDA: vitrine (_CustId_), depois perfil (nickname), por fim API com token de usuário
 app.get('/api/scrape/seller/:sellerId', async (req, res) => {
   try {
     const sellerId = req.params.sellerId;
     const max = Math.min(parseInt(req.query.max || '100', 10), 300);
-    if (!/^\d{6,}$/.test(sellerId)) return res.status(400).json({ error: 'invalid_seller_id' });
+    if (!/^\d{6,}$/.test(sellerId)) {
+      return res.status(400).json({ error: 'invalid_seller_id' });
+    }
 
-    // 1) tenta raspar a vitrine
+    // 1) tenta raspar a vitrine (_CustId_)
     let rows = [];
-    try { rows = await scrapeSellerItems(sellerId, max); }
-    catch (e) { console.warn('scrape falhou, tentando API:', e?.response?.status || e.message); }
+    try {
+      rows = await scrapeSellerItems(sellerId, max);
+    } catch (e) {
+      console.warn('scrape vitrine falhou, tentando perfil:', e?.response?.status || e.message);
+    }
 
-    // 2) se raspagem não trouxe nada, cai para a API com token de usuário
+    // 2) se veio vazio, tenta pelo perfil do vendedor (precisa nickname)
     if (!rows.length) {
-      const viaApi = await fetchSellerViaApi(req, sellerId, max);
+      const nickname = await getSellerNickname(req, sellerId);
+      if (nickname) {
+        try {
+          rows = await scrapeSellerByNickname(req, nickname, max);
+        } catch (e) {
+          console.warn('scrape perfil falhou, tentando API:', e?.response?.status || e.message);
+        }
+      }
+    }
+
+    // 3) se ainda vazio, cai para API oficial com token de usuário
+    if (!rows.length) {
+      const viaApi = await fetchSellerViaApi(req, sellerId, max); // sua função atual
       return res.json(viaApi);
     }
 
-    res.json(rows);
+    return res.json(rows);
   } catch (e) {
     console.error('seller hybrid error', e?.response?.status, e?.response?.data || e.message);
     res.status(500).json({ error: 'seller_hybrid_failed', detail: e?.response?.data || e.message });
   }
 });
+
 
 app.get('/api/seller/:sellerId/items-auth', async (req, res) => {
   try {

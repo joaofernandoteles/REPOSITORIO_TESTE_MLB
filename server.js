@@ -126,6 +126,31 @@ async function scrapeSellerItems(sellerId, max = 100) {
   return out;
 }
 
+// Busca via API oficial (com fallback a app token) e padroniza o formato do Passo 8
+async function fetchSellerViaApi(req, sellerId, max = 100) {
+  const cap = Math.min(Number(max) || 100, 1000);
+  let offset = 0;
+  const all = [];
+  while (all.length < cap) {
+    const resp = await meliGET(req, '/sites/MLB/search', {
+      params: { seller_id: sellerId, limit: Math.min(50, cap - all.length), offset },
+      auth: false // tenta público; se 401/403 meliGET já repete com app token
+    });
+    const arr = resp?.results || [];
+    if (!arr.length) break;
+    all.push(...arr);
+    offset += arr.length;
+  }
+  // mapeia para o mesmo shape do scrape (id, title, price, sold_quantity, permalink)
+  return all.map(x => ({
+    id: x.id,
+    title: x.title,
+    price: x.price,
+    sold_quantity: x.sold_quantity,
+    permalink: x.permalink
+  }));
+}
+
 
 // --- cookie session por usuário ---
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
@@ -376,13 +401,29 @@ app.get('/api/scrape/seller/:sellerId', async (req, res) => {
   try {
     const sellerId = req.params.sellerId;
     const max = Math.min(parseInt(req.query.max || '100', 10), 300);
-    if (!/^\d{6,}$/.test(sellerId)) return res.status(400).json({ error: 'invalid_seller_id' });
+    if (!/^\d{6,}$/.test(sellerId)) {
+      return res.status(400).json({ error: 'invalid_seller_id' });
+    }
 
-    const rows = await scrapeSellerItems(sellerId, max);
+    // 1) tenta raspar a vitrine pública
+    let rows = [];
+    try {
+      rows = await scrapeSellerItems(sellerId, max);
+    } catch (e) {
+      // se a vitrine bloquear/der erro, ignora e cai para API
+      console.warn('scrape falhou, tentando API:', e?.response?.status || e.message);
+    }
+
+    // 2) fallback para API quando scrape trouxe 0
+    if (!rows.length) {
+      const viaApi = await fetchSellerViaApi(req, sellerId, max);
+      return res.json(viaApi);
+    }
+
     res.json(rows);
   } catch (e) {
-    console.error('scrape seller error', e?.response?.status, e?.response?.data || e.message);
-    res.status(500).json({ error: 'scrape_failed', detail: e?.response?.data || e.message });
+    console.error('seller hybrid error', e?.response?.status, e?.response?.data || e.message);
+    res.status(500).json({ error: 'seller_hybrid_failed', detail: e?.response?.data || e.message });
   }
 });
 

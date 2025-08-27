@@ -189,16 +189,25 @@ $('#btnMyItems').onclick = async () => {
 $('#btnSellerItems').onclick = async () => {
   const sid = $('#sellerId').value.trim();
   const max = $('#maxSeller').value.trim() || '200';
-  if(!sid) return alert('Informe o seller_id');
+  if(!sid) return alert('Informe o seller_id numérico');
+
   try {
-    const arr = await fetchJSON(`/api/seller/${encodeURIComponent(sid)}/items?max=${encodeURIComponent(max)}`);
+    // 🔄 novo endpoint SEM TOKEN (raspagem)
+    const arr = await fetchJSON(`/api/scrape/seller/${encodeURIComponent(sid)}?max=${encodeURIComponent(max)}`);
     const mapped = (arr||[]).map(x => ({
-      id: x.id, title: x.title, price: x.price, sold_quantity: x.sold_quantity, listing_type_id: x.listing_type_id,
-      free_shipping: x?.shipping?.free_shipping || false, seller_id: x?.seller?.id, permalink: x.permalink
+      id: x.id,
+      title: x.title,
+      price: x.price,
+      sold_quantity: x.sold_quantity,
+      permalink: x.permalink
     }));
-    tbl.set(mapped); window.__rows = mapped;
-  } catch(e){ alert('Falha: ' + e.message); }
+    tbl.set(mapped);
+    window.__rows = mapped;
+  } catch(e){
+    alert('Falha: ' + e.message);
+  }
 };
+
 
 $('#btnSearch').onclick = async () => {
   const q = $('#q').value.trim(); const max = $('#maxQ').value.trim() || '100';

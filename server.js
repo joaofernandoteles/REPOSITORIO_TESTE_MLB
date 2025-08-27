@@ -21,6 +21,113 @@ app.use(cors());
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
+// ==== RASPAGEM (HTML) SEM TOKEN — "Passo 8" ====
+import crypto from 'crypto'; // (se já tiver lá, ignore)
+
+// Headers p/ parecer navegador
+const UA_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36',
+  'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8'
+};
+
+async function fetchHtml(url) {
+  const { data } = await axios.get(url, { headers: UA_HEADERS, maxRedirects: 5, timeout: 20000 });
+  return data;
+}
+
+function canonicalMlbId(s) {
+  const m = /MLB-?(\d{6,})/.exec(s);
+  return m ? 'MLB' + m[1] : null;
+}
+
+function extractIdsFromHtml(html) {
+  const ids = new Set();
+  const re = /MLB-?\d{6,}/g;
+  let m;
+  while ((m = re.exec(html))) {
+    const id = canonicalMlbId(m[0]);
+    if (id) ids.add(id);
+  }
+  return Array.from(ids);
+}
+
+// tenta pegar dados do <script type="application/ld+json"> e outros pontos da página
+function parseProductFromHtml(html, id) {
+  let title = '', price = null, permalink = '', sold_quantity = null;
+
+  // 1) JSON-LD Product
+  const reLd = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  let match;
+  while ((match = reLd.exec(html))) {
+    try {
+      const json = JSON.parse(match[1].trim());
+      const arr = Array.isArray(json) ? json : [json];
+      for (const obj of arr) {
+        const t = obj['@type'];
+        const isProduct = t === 'Product' || (Array.isArray(t) && t.includes('Product'));
+        if (isProduct) {
+          title = title || obj.name || '';
+          const offers = Array.isArray(obj.offers) ? obj.offers[0] : obj.offers;
+          const p = offers?.price ?? offers?.priceSpecification?.price;
+          const pn = p != null ? Number(String(p).replace(/[^\d.,-]/g, '').replace('.', '').replace(',', '.')) : NaN;
+          if (!Number.isNaN(pn)) price = pn;
+          permalink = permalink || obj.url || '';
+        }
+      }
+    } catch {}
+  }
+
+  // 2) sold_quantity em JSON interno
+  let m2 = html.match(/"sold_quantity"\s*:\s*(\d+)/);
+  if (m2) sold_quantity = parseInt(m2[1], 10);
+
+  // 3) fallback em texto ("vendidos")
+  if (!sold_quantity) {
+    const m3 = html.match(/(\d[\d\.]*)\s*(vendidos|vendido)/i);
+    if (m3) sold_quantity = parseInt(m3[1].replace(/\./g, ''), 10);
+  }
+
+  // 4) canonical link
+  if (!permalink) {
+    const m4 = html.match(/<link\s+rel=["']canonical["']\s+href=["']([^"']+)["']/i);
+    if (m4) permalink = m4[1];
+  }
+
+  return { id, title, price, sold_quantity, permalink };
+}
+
+async function scrapeSellerItems(sellerId, max = 100) {
+  const listUrl = `https://lista.mercadolivre.com.br/_CustId_${sellerId}`;
+  const html = await fetchHtml(listUrl);
+  let ids = extractIdsFromHtml(html);
+  if (!ids.length) return [];
+
+  ids = ids.slice(0, Math.min(max, 300)); // limite de segurança
+
+  // baixa páginas de produto em paralelo (pool)
+  const out = [];
+  const pool = Math.min(6, ids.length);
+  let idx = 0;
+
+  async function worker() {
+    while (idx < ids.length) {
+      const my = ids[idx++];
+      try {
+        const url = `https://produto.mercadolivre.com.br/${my}`;
+        const h = await fetchHtml(url);
+        const info = parseProductFromHtml(h, my);
+        out.push(info);
+      } catch (e) {
+        out.push({ id: my, error: 'fetch_failed' });
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: pool }, () => worker()));
+  return out;
+}
+
+
 // --- cookie session por usuário ---
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(32).toString('hex');
 app.use(cookieSession({
@@ -40,6 +147,26 @@ const setCreds = (req, { client_id, client_secret, redirect_uri }) => req.sessio
 const getTokens = req => req.session?.tokens || null;
 const setTokens = (req, tokens) => req.session.tokens = tokens;
 const clearSession = req => req.session = null;
+
+// token da aplicação (client_credentials) para chamadas públicas
+async function getAppToken(req) {
+  const creds = getCreds(req);
+  if (!creds) throw new Error('Missing client setup');
+  const now = Date.now();
+  const appTok = req.session?.app_token;
+  if (appTok && now < appTok.expires_at) return appTok.access_token;
+
+  const url = 'https://api.mercadolibre.com/oauth/token';
+  const payload = new URLSearchParams({
+    grant_type: 'client_credentials',
+    client_id: creds.client_id,
+    client_secret: creds.client_secret
+  });
+  const { data } = await axios.post(url, payload);
+  const expires_at = now + ((data.expires_in || 3600) - 60) * 1000;
+  req.session.app_token = { access_token: data.access_token, expires_at };
+  return data.access_token;
+}
 
 async function exchangeCodeForTokens(req, code) {
   const creds = getCreds(req);
@@ -81,22 +208,37 @@ async function refreshIfNeeded(req) {
 async function meliGET(req, endpoint, { params = {}, auth = false } = {}) {
   const url = `https://api.mercadolibre.com${endpoint}`;
   const headers = { 'Accept': 'application/json' };
-  if (auth) {
-    const token = await refreshIfNeeded(req);
-    headers['Authorization'] = `Bearer ${token}`;
-  }
+
+  // quando auth=true usa o token do usuário
+  if (auth) headers['Authorization'] = `Bearer ${await refreshIfNeeded(req)}`;
+
   for (let i = 0; i < 3; i++) {
     try {
       const resp = await axios.get(url, { params, headers });
       return resp.data;
     } catch (err) {
       const status = err.response?.status;
+      const msg = err.response?.data?.message || err.response?.data?.error || '';
+
+      // 🔁 se a chamada era "pública" e falhou por falta de auth, tenta com app token
+      if (!auth && i === 0 && (status === 401 || status === 403)) {
+        try {
+          const appToken = await getAppToken(req);
+          headers['Authorization'] = `Bearer ${appToken}`;
+          // tenta de novo já com Authorization
+          continue;
+        } catch (_) {
+          // se não conseguiu app token, cai para tratamento normal
+        }
+      }
+
       if (status === 429) { await new Promise(r => setTimeout(r, 1200 * (i + 1))); continue; }
       if (status === 401 && auth && i === 0) { await refreshIfNeeded(req); continue; }
       throw err;
     }
   }
 }
+
 
 // Rotas utilitárias
 app.get('/api/ping', (req,res)=>res.json({ ok:true, time:Date.now(), prod: IS_PROD }));
@@ -229,6 +371,22 @@ app.get('/api/items', async (req, res) => {
     res.status(500).json({ error: 'items_failed', detail: e.response?.data || e.message });
   }
 });
+
+// Rota do "Passo 8" — sem token: raspa a vitrine pública e as páginas dos produtos
+app.get('/api/scrape/seller/:sellerId', async (req, res) => {
+  try {
+    const sellerId = req.params.sellerId;
+    const max = Math.min(parseInt(req.query.max || '100', 10), 300);
+    if (!/^\d{6,}$/.test(sellerId)) return res.status(400).json({ error: 'invalid_seller_id' });
+
+    const rows = await scrapeSellerItems(sellerId, max);
+    res.json(rows);
+  } catch (e) {
+    console.error('scrape seller error', e?.response?.status, e?.response?.data || e.message);
+    res.status(500).json({ error: 'scrape_failed', detail: e?.response?.data || e.message });
+  }
+});
+
 
 // Error handler
 app.use((err, req, res, next) => { console.error('Unhandled error:', err); res.status(500).send('Server error'); });

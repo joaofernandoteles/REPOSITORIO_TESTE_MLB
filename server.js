@@ -127,21 +127,35 @@ async function scrapeSellerItems(sellerId, max = 100) {
 }
 
 // Busca via API oficial (com fallback a app token) e padroniza o formato do Passo 8
+// Usa SEMPRE o token de USUÁRIO (OAuth) e ainda envia também como query param
 async function fetchSellerViaApi(req, sellerId, max = 100) {
   const cap = Math.min(Number(max) || 100, 1000);
+  const token = await refreshIfNeeded(req);              // garante token do usuário
   let offset = 0;
   const all = [];
+
   while (all.length < cap) {
-    const resp = await meliGET(req, '/sites/MLB/search', {
-      params: { seller_id: sellerId, limit: Math.min(50, cap - all.length), offset },
-      auth: true   // usa o token de USUÁRIO (OAuth)
-    });
-    const arr = resp?.results || [];
+    const params = {
+      seller_id: sellerId,
+      limit: Math.min(50, cap - all.length),
+      offset,
+      access_token: token                                // manda tb na query
+    };
+    const headers = {
+      'Accept': 'application/json',
+      'Authorization': `Bearer ${token}`                 // e no header
+    };
+
+    const url = 'https://api.mercadolibre.com/sites/MLB/search';
+    const resp = await axios.get(url, { params, headers });
+    const arr = resp?.data?.results || [];
     if (!arr.length) break;
+
     all.push(...arr);
     offset += arr.length;
   }
-  // mapeia para o mesmo shape do scrape (id, title, price, sold_quantity, permalink)
+
+  // normaliza pro mesmo formato do Passo 8
   return all.map(x => ({
     id: x.id,
     title: x.title,
@@ -150,6 +164,7 @@ async function fetchSellerViaApi(req, sellerId, max = 100) {
     permalink: x.permalink
   }));
 }
+
 
 
 // --- cookie session por usuário ---
@@ -419,20 +434,14 @@ app.get('/api/scrape/seller/:sellerId', async (req, res) => {
   try {
     const sellerId = req.params.sellerId;
     const max = Math.min(parseInt(req.query.max || '100', 10), 300);
-    if (!/^\d{6,}$/.test(sellerId)) {
-      return res.status(400).json({ error: 'invalid_seller_id' });
-    }
+    if (!/^\d{6,}$/.test(sellerId)) return res.status(400).json({ error: 'invalid_seller_id' });
 
-    // 1) tenta raspar a vitrine pública
+    // 1) tenta raspar a vitrine
     let rows = [];
-    try {
-      rows = await scrapeSellerItems(sellerId, max);
-    } catch (e) {
-      // se a vitrine bloquear/der erro, ignora e cai para API
-      console.warn('scrape falhou, tentando API:', e?.response?.status || e.message);
-    }
+    try { rows = await scrapeSellerItems(sellerId, max); }
+    catch (e) { console.warn('scrape falhou, tentando API:', e?.response?.status || e.message); }
 
-    // 2) fallback para API quando scrape trouxe 0
+    // 2) se raspagem não trouxe nada, cai para a API com token de usuário
     if (!rows.length) {
       const viaApi = await fetchSellerViaApi(req, sellerId, max);
       return res.json(viaApi);
@@ -445,6 +454,17 @@ app.get('/api/scrape/seller/:sellerId', async (req, res) => {
   }
 });
 
+app.get('/api/seller/:sellerId/items-auth', async (req, res) => {
+  try {
+    const sellerId = req.params.sellerId;
+    const max = Math.min(parseInt(req.query.max || '100', 10), 1000);
+    const out = await fetchSellerViaApi(req, sellerId, max);
+    res.json(out);
+  } catch (e) {
+    console.error('seller items auth error', e?.response?.status, e?.response?.data || e.message);
+    res.status(500).json({ error: 'seller_items_auth_failed', detail: e?.response?.data || e.message });
+  }
+});
 
 // Error handler
 app.use((err, req, res, next) => { console.error('Unhandled error:', err); res.status(500).send('Server error'); });

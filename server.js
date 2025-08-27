@@ -303,6 +303,11 @@ app.post('/api/setup', (req, res) => {
 
 app.post('/api/logout', (req, res) => { clearSession(req); res.json({ ok: true }); });
 
+app.get('/logout', (req, res) => {
+  clearSession(req);           // req.session = null
+  res.redirect('/?logged_out=1');
+});
+
 // OAuth
 app.get('/authorize', (req, res) => {
   const creds = getCreds(req);

@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
+    "postinstall": "npx puppeteer browsers install chromium --cache-dir=.puppeteer",
     "dev": "node server.js"
   },
   "dependencies": {

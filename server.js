@@ -96,32 +96,58 @@ function parseProductFromHtml(html, id) {
 }
 
 async function scrapeSellerItems(sellerId, max = 100) {
-  const listUrl = `https://lista.mercadolivre.com.br/_CustId_${sellerId}`;
-  const html = await fetchHtml(listUrl);
-  let ids = extractIdsFromHtml(html);
-  if (!ids.length) return [];
+  const cap = Math.min(max, 300);        // segurança
+  const pageSize = 50;                    // vitrine costuma paginar de 50 em 50
+  const seen = new Set();
 
-  ids = ids.slice(0, Math.min(max, 300)); // limite de segurança
+  // paginação: /_CustId_{id} (primeira) e depois /_CustId_{id}_Desde_{offset+1}
+  let offset = 0;
+  let tries = 0;
+  while (seen.size < cap && tries < 12) { // até ~600 itens no limite
+    const pageUrl = offset === 0
+      ? `https://lista.mercadolivre.com.br/_CustId_${sellerId}`
+      : `https://lista.mercadolivre.com.br/_CustId_${sellerId}_Desde_${offset+1}`;
+
+    let html = '';
+    try {
+      html = await fetchHtml(pageUrl);
+    } catch (e) {
+      // se uma página falhar, tenta a próxima
+      offset += pageSize;
+      tries++;
+      continue;
+    }
+
+    const ids = extractIdsFromHtml(html);
+    ids.forEach(id => seen.add(id));
+
+    // se esta página não trouxe IDs novos, paramos a paginação
+    if (ids.length === 0) break;
+
+    offset += pageSize;
+    tries++;
+  }
+
+  const list = Array.from(seen).slice(0, cap);
+  if (!list.length) return [];
 
   // baixa páginas de produto em paralelo (pool)
   const out = [];
-  const pool = Math.min(6, ids.length);
+  const pool = Math.min(6, list.length);
   let idx = 0;
 
   async function worker() {
-    while (idx < ids.length) {
-      const my = ids[idx++];
+    while (idx < list.length) {
+      const my = list[idx++];
       try {
         const url = `https://produto.mercadolivre.com.br/${my}`;
         const h = await fetchHtml(url);
-        const info = parseProductFromHtml(h, my);
-        out.push(info);
-      } catch (e) {
+        out.push(parseProductFromHtml(h, my));
+      } catch {
         out.push({ id: my, error: 'fetch_failed' });
       }
     }
   }
-
   await Promise.all(Array.from({ length: pool }, () => worker()));
   return out;
 }
@@ -535,53 +561,43 @@ app.get('/api/scrape/seller/:sellerId', async (req, res) => {
   try {
     const sellerId = req.params.sellerId;
     const max = Math.min(parseInt(req.query.max || '100', 10), 300);
+    if (!/^\d{6,}$/.test(sellerId)) return res.status(400).json({ error: 'invalid_seller_id' });
 
-    if (!/^\d{6,}$/.test(sellerId)) {
-      return res.status(400).json({ error: 'invalid_seller_id' });
-    }
-
+    // 1) SCRAPE da vitrine com paginação (igual planilha, mas robusto)
     let rows = [];
-
-    // --- ESTRATÉGIA CORRIGIDA ---
-
-    // 1) Tenta usar a API oficial primeiro. É o método mais confiável.
-    //    A função fetchSellerViaApi já tenta usar o token de usuário e, se falhar,
-    //    usa o token da aplicação (client_credentials).
     try {
-      console.log(`Tentando buscar vendedor ${sellerId} via API oficial.`);
-      rows = await fetchSellerViaApi(req, sellerId, max);
+      rows = await scrapeSellerItems(sellerId, max);
     } catch (e) {
-      console.warn('Busca via API oficial falhou. Tentando fallback para scraping.', e.message);
-      // Se a API falhar (o que não deveria ser comum), podemos tentar o scraping.
+      console.warn('scrape vitrine falhou:', e?.response?.status || e.message);
     }
 
-    // 2) Se a API não retornou nada (ou falhou), tenta o scraping como ÚLTIMO RECURSO.
+    // 2) Se ainda vazio, tenta perfil por nickname (scrape também)
     if (!rows.length) {
-      try {
-        console.log(`API não retornou dados. Tentando scraping da vitrine para o vendedor ${sellerId}.`);
-        rows = await scrapeSellerItems(sellerId, max);
-      } catch (e) {
-        console.error('Fallback para scraping também falhou.', e.message);
-        // Se o scraping também falhar, aí sim retornamos o erro.
-        // O erro original provavelmente virá da falha da API, que é mais informativo.
-        throw new Error('Tanto a API oficial quanto o scraping falharam em obter os itens do vendedor.');
+      const nickname = await getSellerNickname(req, sellerId); // usa /users/{id} (seu token de usuário)
+      if (nickname) {
+        try {
+          rows = await scrapeSellerByNickname(req, nickname, max);
+        } catch (e) {
+          console.warn('scrape perfil falhou:', e?.response?.status || e.message);
+        }
       }
     }
 
-    // Se mesmo após o scraping não houver dados, pode ser que o vendedor não tenha itens.
+    // 3) Último recurso: API (com os patches de token que já fez)
     if (!rows.length) {
-        console.log(`Nenhum item encontrado para o vendedor ${sellerId} após todas as tentativas.`);
+      try {
+        rows = await fetchSellerViaApi(req, sellerId, max);
+      } catch (e) {
+        console.error('fallback API falhou:', e?.response?.status, e?.response?.data || e.message);
+        // se até a API falhar, devolve erro
+        return res.status(500).json({ error: 'seller_hybrid_failed', detail: e?.response?.data || e.message });
+      }
     }
 
     return res.json(rows);
-
   } catch (e) {
-    // Loga o erro final para depuração no servidor
-    console.error('Erro final na rota /api/scrape/seller:', e?.response?.data || e.message);
-    res.status(500).json({
-      error: 'seller_hybrid_failed',
-      detail: e?.response?.data || { message: e.message }
-    });
+    console.error('Erro final /api/scrape/seller:', e?.response?.data || e.message);
+    res.status(500).json({ error: 'seller_hybrid_failed', detail: e?.response?.data || e.message });
   }
 });
 

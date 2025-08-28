@@ -557,49 +557,60 @@ app.get('/api/items', async (req, res) => {
 
 // Rota do "Passo 8" — sem token: raspa a vitrine pública e as páginas dos produtos
 // HÍBRIDA: vitrine (_CustId_), depois perfil (nickname), por fim API com token de usuário
+// SCRAPE-ONLY por padrão (igual à planilha).
+// Se quiser tentar API como último recurso, chame com ?mode=hybrid
 app.get('/api/scrape/seller/:sellerId', async (req, res) => {
   try {
     const sellerId = req.params.sellerId;
     const max = Math.min(parseInt(req.query.max || '100', 10), 300);
-    if (!/^\d{6,}$/.test(sellerId)) return res.status(400).json({ error: 'invalid_seller_id' });
+    const mode = String(req.query.mode || 'scrape').toLowerCase(); // 'scrape' | 'hybrid'
 
-    // 1) SCRAPE da vitrine com paginação (igual planilha, mas robusto)
+    if (!/^\d{6,}$/.test(sellerId)) {
+      return res.status(400).json({ error: 'invalid_seller_id' });
+    }
+
     let rows = [];
+
+    // 1) SCRAPE da vitrine (paginado)
     try {
       rows = await scrapeSellerItems(sellerId, max);
+      console.log(`[scrape] vitrine: ${rows.length} itens`);
     } catch (e) {
-      console.warn('scrape vitrine falhou:', e?.response?.status || e.message);
+      console.warn('[scrape] vitrine falhou:', e?.response?.status || e.message);
     }
 
-    // 2) Se ainda vazio, tenta perfil por nickname (scrape também)
-    if (!rows.length) {
-      const nickname = await getSellerNickname(req, sellerId); // usa /users/{id} (seu token de usuário)
-      if (nickname) {
-        try {
-          rows = await scrapeSellerByNickname(req, nickname, max);
-        } catch (e) {
-          console.warn('scrape perfil falhou:', e?.response?.status || e.message);
-        }
-      }
-    }
-
-    // 3) Último recurso: API (com os patches de token que já fez)
+    // 2) Se vazio, SCRAPE do perfil (nickname)
     if (!rows.length) {
       try {
-        rows = await fetchSellerViaApi(req, sellerId, max);
+        const nickname = await getSellerNickname(req, sellerId); // usa /users/{id} com seu token
+        if (nickname) {
+          rows = await scrapeSellerByNickname(req, nickname, max);
+          console.log(`[scrape] perfil ${nickname}: ${rows.length} itens`);
+        }
       } catch (e) {
-        console.error('fallback API falhou:', e?.response?.status, e?.response?.data || e.message);
-        // se até a API falhar, devolve erro
-        return res.status(500).json({ error: 'seller_hybrid_failed', detail: e?.response?.data || e.message });
+        console.warn('[scrape] perfil falhou:', e?.response?.status || e.message);
       }
     }
 
-    return res.json(rows);
+    // 3) Se continuar vazio e você EXPLICITOU que quer híbrido, tenta API
+    if (!rows.length && mode === 'hybrid') {
+      try {
+        rows = await fetchSellerViaApi(req, sellerId, max);
+        console.log(`[api] fallback: ${rows.length} itens`);
+      } catch (e) {
+        console.error('[api] fallback falhou:', e?.response?.status, e?.response?.data || e.message);
+        // Importante: NÃO joga erro 500 — continua retornando vazio (igual planilha)
+        rows = [];
+      }
+    }
+
+    return res.json(rows); // nunca 403/500 aqui; no pior caso, retorna []
   } catch (e) {
     console.error('Erro final /api/scrape/seller:', e?.response?.data || e.message);
     res.status(500).json({ error: 'seller_hybrid_failed', detail: e?.response?.data || e.message });
   }
 });
+
 
 
 app.get('/api/seller/:sellerId/items-auth', async (req, res) => {

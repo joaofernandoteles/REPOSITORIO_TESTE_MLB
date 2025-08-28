@@ -110,6 +110,9 @@
         <div id="readyMsg" class="tag">—</div>
       </div>
       <a href="/authorize"><button>Conectar ao Mercado Livre</button></a>
+      <div>
+        <button id="btnSellerItemsHeadless">Buscar (navegador real)</button>
+      </div>
     </div>
   </section>
 
@@ -291,6 +294,17 @@
     $('#btnExport').onclick = () => {
       if (!window.__rows?.length) return alert('Nada para exportar');
       saveCSV('mlb_resultados.csv', window.__rows);
+    };
+
+    $('#btnSellerItemsHeadless').onclick = async () => {
+      const sid = $('#sellerId').value.trim();
+      const max = $('#maxSeller').value.trim() || '60';
+      if (!sid) return alert('Informe o seller_id numérico');
+      try {
+        const arr = await fetchJSON(`/api/scrape2/seller/${encodeURIComponent(sid)}?max=${encodeURIComponent(max)}`);
+        const mapped = (arr || []).map(x => ({ id: x.id, title: x.title, price: x.price, sold_quantity: x.sold_quantity, permalink: x.permalink, error: x.error || '' }));
+        tbl.set(mapped); window.__rows = mapped;
+      } catch (e) { alert('Falha: ' + e.message); }
     };
 
     refreshState();

@@ -25,8 +25,10 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 // Headers p/ parecer navegador
 const UA_HEADERS = {
-  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123 Safari/537.36',
-  'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8'
+  'User-Agent': 'Mozilla/5.0 ...',
+  'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
+  'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'Referer': 'https://lista.mercadolivre.com.br/'
 };
 
 async function fetchHtml(url) {
@@ -96,56 +98,40 @@ function parseProductFromHtml(html, id) {
 }
 
 async function scrapeSellerItems(sellerId, max = 100) {
-  const cap = Math.min(max, 300);        // segurança
-  const pageSize = 50;                    // vitrine costuma paginar de 50 em 50
+  const cap = Math.min(max, 300);
+  const pageSize = 50;
   const seen = new Set();
 
-  // paginação: /_CustId_{id} (primeira) e depois /_CustId_{id}_Desde_{offset+1}
-  let offset = 0;
-  let tries = 0;
-  while (seen.size < cap && tries < 12) { // até ~600 itens no limite
+  let offset = 0, tries = 0;
+  while (seen.size < cap && tries < 12) {
     const pageUrl = offset === 0
       ? `https://lista.mercadolivre.com.br/_CustId_${sellerId}`
       : `https://lista.mercadolivre.com.br/_CustId_${sellerId}_Desde_${offset+1}`;
 
     let html = '';
-    try {
-      html = await fetchHtml(pageUrl);
-    } catch (e) {
-      // se uma página falhar, tenta a próxima
-      offset += pageSize;
-      tries++;
-      continue;
-    }
+    try { html = await fetchHtml(pageUrl); }
+    catch { offset += pageSize; tries++; continue; }
 
     const ids = extractIdsFromHtml(html);
     ids.forEach(id => seen.add(id));
-
-    // se esta página não trouxe IDs novos, paramos a paginação
     if (ids.length === 0) break;
 
-    offset += pageSize;
-    tries++;
+    offset += pageSize; tries++;
   }
 
   const list = Array.from(seen).slice(0, cap);
   if (!list.length) return [];
 
-  // baixa páginas de produto em paralelo (pool)
   const out = [];
   const pool = Math.min(6, list.length);
   let idx = 0;
-
-  async function worker() {
+  async function worker(){
     while (idx < list.length) {
-      const my = list[idx++];
+      const id = list[idx++];
       try {
-        const url = `https://produto.mercadolivre.com.br/${my}`;
-        const h = await fetchHtml(url);
-        out.push(parseProductFromHtml(h, my));
-      } catch {
-        out.push({ id: my, error: 'fetch_failed' });
-      }
+        const h = await fetchHtml(`https://produto.mercadolivre.com.br/${id}`);
+        out.push(parseProductFromHtml(h, id));
+      } catch { out.push({ id, error: 'fetch_failed' }); }
     }
   }
   await Promise.all(Array.from({ length: pool }, () => worker()));
@@ -559,6 +545,8 @@ app.get('/api/items', async (req, res) => {
 // HÍBRIDA: vitrine (_CustId_), depois perfil (nickname), por fim API com token de usuário
 // SCRAPE-ONLY por padrão (igual à planilha).
 // Se quiser tentar API como último recurso, chame com ?mode=hybrid
+// SCRAPE-ONLY por padrão (igual à planilha).
+// Se quiser tentar API como último recurso, chame com ?mode=hybrid
 app.get('/api/scrape/seller/:sellerId', async (req, res) => {
   try {
     const sellerId = req.params.sellerId;
@@ -592,24 +580,25 @@ app.get('/api/scrape/seller/:sellerId', async (req, res) => {
       }
     }
 
-    // 3) Se continuar vazio e você EXPLICITOU que quer híbrido, tenta API
+    // 3) Só se você pedir explicitamente: tenta API como último recurso
     if (!rows.length && mode === 'hybrid') {
       try {
         rows = await fetchSellerViaApi(req, sellerId, max);
         console.log(`[api] fallback: ${rows.length} itens`);
       } catch (e) {
         console.error('[api] fallback falhou:', e?.response?.status, e?.response?.data || e.message);
-        // Importante: NÃO joga erro 500 — continua retornando vazio (igual planilha)
+        // IMPORTANTE: não joga 500 — segue devolvendo []
         rows = [];
       }
     }
 
-    return res.json(rows); // nunca 403/500 aqui; no pior caso, retorna []
+    return res.json(rows); // igual planilha: retorna lista ou []
   } catch (e) {
     console.error('Erro final /api/scrape/seller:', e?.response?.data || e.message);
     res.status(500).json({ error: 'seller_hybrid_failed', detail: e?.response?.data || e.message });
   }
 });
+
 
 
 

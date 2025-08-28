@@ -7,6 +7,9 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import cookieSession from 'cookie-session';
 import crypto from 'crypto';
+import {install, detectBrowserPlatform, Browser, resolveBuildId, computeExecutablePath} from '@puppeteer/browsers';
+import fs from 'fs';
+import os from 'os';
 
 dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
@@ -658,11 +661,41 @@ app.get('/api/raw/sites-search', async (req, res) => {
 
 import puppeteer from 'puppeteer';
 
+
+// Garante um Chromium disponível em runtime (Render) baixando para /tmp/puppeteer
+async function ensureChromiumPath() {
+  // 1) se já foi definido via env
+  if (process.env.PUPPETEER_EXECUTABLE_PATH && fs.existsSync(process.env.PUPPETEER_EXECUTABLE_PATH)) {
+    return process.env.PUPPETEER_EXECUTABLE_PATH;
+  }
+  // 2) tenta caminho padrão do puppeteer (se já houver)
+  try {
+    const p = puppeteer.executablePath();
+    if (p && fs.existsSync(p)) return p;
+  } catch {}
+
+  // 3) baixa agora com @puppeteer/browsers para /tmp (gravável no Render)
+  const cacheDir = process.env.PUPPETEER_CACHE_DIR || '/tmp/puppeteer';
+  fs.mkdirSync(cacheDir, { recursive: true });
+
+  const platform = detectBrowserPlatform();
+  const buildId = await resolveBuildId(Browser.CHROMIUM, platform, 'stable');
+
+  await install({ cacheDir, browser: Browser.CHROMIUM, platform, buildId });
+  const execPath = computeExecutablePath({ cacheDir, browser: Browser.CHROMIUM, platform, buildId });
+
+  // opcional: fixa em env para próximos launches
+  process.env.PUPPETEER_EXECUTABLE_PATH = execPath;
+  return execPath;
+}
+
+
 // Renderiza a vitrine do seller como um navegador real e coleta IDs (MLB...)
 async function headlessCollectIds(sellerId, max = 120) {
   const browser = await puppeteer.launch({
-    args: ['--no-sandbox','--disable-setuid-sandbox'],
-    headless: 'new'
+    executablePath: puppeteer.executablePath(),      // 👈 garante caminho certo
+    headless: 'new',
+    args: ['--no-sandbox', '--disable-setuid-sandbox']
   });
   const page = await browser.newPage();
   await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36');
@@ -701,7 +734,7 @@ async function headlessCollectIds(sellerId, max = 120) {
 // Abre a página do produto e extrai título/preço/vendidos/permalink via DOM/JSON-LD
 async function headlessFetchItems(ids) {
   const browser = await puppeteer.launch({
-    args: ['--no-sandbox','--disable-setuid-sandbox'],
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
     headless: 'new'
   });
 
@@ -733,7 +766,7 @@ async function headlessFetchItems(ids) {
             const offers = Array.isArray(obj.offers) ? obj.offers[0] : obj.offers;
             const p = offers?.price ?? offers?.priceSpecification?.price;
             if (p != null) {
-              const pn = Number(String(p).replace(/[^\d.,-]/g,'').replace('.', '').replace(',', '.'));
+              const pn = Number(String(p).replace(/[^\d.,-]/g, '').replace('.', '').replace(',', '.'));
               if (!Number.isNaN(pn)) price = pn;
             }
             permalink ||= obj.url || '';
@@ -745,13 +778,13 @@ async function headlessFetchItems(ids) {
           }
           if (!title) {
             title = document.querySelector('h1')?.textContent?.trim() ||
-                    document.querySelector('meta[property="og:title"]')?.getAttribute('content') || '';
+              document.querySelector('meta[property="og:title"]')?.getAttribute('content') || '';
           }
           if (!price) {
             const frac = document.querySelector('.andes-money-amount__fraction')?.textContent || '';
             const dec = document.querySelector('.andes-money-amount__cents')?.textContent || '';
             const raw = (frac ? frac : '') + (dec ? ',' + dec : '');
-            const pn = Number(raw.replace(/\./g,'').replace(',','.'));
+            const pn = Number(raw.replace(/\./g, '').replace(',', '.'));
             if (!Number.isNaN(pn)) price = pn;
           }
           if (!sold_quantity) {
@@ -759,7 +792,7 @@ async function headlessFetchItems(ids) {
               .map(e => e.textContent || '')
               .find(t => /vendid/i.test(t));
             if (sold) {
-              const n = parseInt(sold.replace(/[^\d]/g,''), 10);
+              const n = parseInt(sold.replace(/[^\d]/g, ''), 10);
               if (!Number.isNaN(n)) sold_quantity = n;
             }
           }

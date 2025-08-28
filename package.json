@@ -1,18 +1,19 @@
 {
   "name": "mlb-dashboard-multiuser",
-  "version": "1.2.0",
+  "version": "1.4.3",
   "type": "module",
   "scripts": {
-    "start": "node server.js",
-    "postinstall": "npx puppeteer browsers install chromium --cache-dir=.puppeteer",
-    "dev": "node server.js"
+    "start": "node server.js"
   },
+  "license": "UNLICENSED",
+  "engines": { "node": ">=18 <23" },
   "dependencies": {
     "axios": "^1.7.2",
     "cookie-session": "^2.0.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "puppeteer": "^22.8.2"
+    "puppeteer": "^22.15.0",
+    "@puppeteer/browsers": "^2.3.0"
   }
 }

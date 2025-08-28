@@ -117,7 +117,7 @@ async function scrapeSellerItems(sellerId, max = 100) {
   while (seen.size < cap && tries < 12) {
     const pageUrl = offset === 0
       ? `https://lista.mercadolivre.com.br/_CustId_${sellerId}`
-      : `https://lista.mercadolivre.com.br/_CustId_${sellerId}_Desde_${offset+1}`;
+      : `https://lista.mercadolivre.com.br/_CustId_${sellerId}_Desde_${offset + 1}`;
 
     let html = '';
     try { html = await fetchHtml(pageUrl); }
@@ -136,7 +136,7 @@ async function scrapeSellerItems(sellerId, max = 100) {
   const out = [];
   const pool = Math.min(6, list.length);
   let idx = 0;
-  async function worker(){
+  async function worker() {
     while (idx < list.length) {
       const id = list[idx++];
       try {
@@ -154,13 +154,15 @@ async function scrapeSellerItems(sellerId, max = 100) {
 // Busca itens do seller via API oficial, tentando primeiro TOKEN DE USUÁRIO,
 // e se der 401/403, tenta automaticamente com APP TOKEN (client_credentials).
 async function fetchSellerViaApi(req, sellerId, max = 100) {
+  const creds = getCreds(req) || {};
+  const X_CALLER = creds.client_id || process.env.APP_CLIENT_ID || process.env.CLIENT_ID || '';
   const cap = Math.min(Number(max) || 100, 1000);
   let offset = 0;
   const all = [];
 
   // tenta obter token de usuário; se não tiver, segue sem (tentará app token)
   let userToken = null;
-  try { userToken = await refreshIfNeeded(req); } catch (_) {}
+  try { userToken = await refreshIfNeeded(req); } catch (_) { }
 
   while (all.length < cap) {
     const limit = Math.min(50, cap - all.length);
@@ -193,7 +195,11 @@ async function fetchSellerViaApi(req, sellerId, max = 100) {
       try {
         const r2 = await axios.get(url, {
           params: { ...baseParams, access_token: appTok },
-          headers: { 'Accept': 'application/json', 'Authorization': `Bearer ${appTok}` },
+          headers: {
+            'Accept': 'application/json',
+            'Authorization': `Bearer ${userToken}`,     // ou appTok, no outro bloco
+            'X-Caller-Id': X_CALLER
+          },
           timeout: 20000
         });
         data = r2.data;

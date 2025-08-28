@@ -631,6 +631,32 @@ app.get('/api/seller/:sellerId/items-auth', async (req, res) => {
   }
 });
 
+// Usa SEU token de USUÁRIO direto no /sites/MLB/search
+app.get('/api/raw/sites-search', async (req, res) => {
+  try {
+    const token = await refreshIfNeeded(req); // precisa estar authed:true na MESMA aba
+    const creds = getCreds(req) || {};
+    const X_CALLER = creds.client_id || process.env.APP_CLIENT_ID || process.env.CLIENT_ID || '';
+
+    const url = 'https://api.mercadolibre.com/sites/MLB/search';
+    const params = { ...req.query, access_token: token };
+    const headers = {
+      'Accept': 'application/json',
+      'Authorization': `Bearer ${token}`,
+      'X-Caller-Id': X_CALLER
+    };
+
+    const r = await axios.get(url, { params, headers, timeout: 20000 });
+    res.json(r.data);
+  } catch (e) {
+    res.status(e.response?.status || 500).json({
+      error: 'raw_sites_search_failed',
+      detail: e.response?.data || e.message
+    });
+  }
+});
+
+
 // Error handler
 app.use((err, req, res, next) => { console.error('Unhandled error:', err); res.status(500).send('Server error'); });
 

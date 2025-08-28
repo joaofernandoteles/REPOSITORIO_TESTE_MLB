@@ -656,6 +656,148 @@ app.get('/api/raw/sites-search', async (req, res) => {
   }
 });
 
+import puppeteer from 'puppeteer';
+
+// Renderiza a vitrine do seller como um navegador real e coleta IDs (MLB...)
+async function headlessCollectIds(sellerId, max = 120) {
+  const browser = await puppeteer.launch({
+    args: ['--no-sandbox','--disable-setuid-sandbox'],
+    headless: 'new'
+  });
+  const page = await browser.newPage();
+  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36');
+  await page.setExtraHTTPHeaders({
+    'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8'
+  });
+
+  const pageSize = 50;
+  const seen = new Set();
+
+  for (let offset = 0; seen.size < max && offset < 600; offset += pageSize) {
+    const url = offset === 0
+      ? `https://lista.mercadolivre.com.br/_CustId_${sellerId}`
+      : `https://lista.mercadolivre.com.br/_CustId_${sellerId}_Desde_${offset + 1}`;
+
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+    // dá um tempinho pra UI montar
+    await page.waitForTimeout(1500);
+
+    const ids = await page.$$eval('a[href*="/MLB-"], a[href*="/MLB"]', as =>
+      Array.from(new Set(
+        as.map(a => (a.getAttribute('href') || '')
+          .match(/\/(MLB-?\d{6,})/i)?.[1])
+          .filter(Boolean)
+      ))
+    );
+
+    ids.forEach(raw => seen.add(raw.replace('-', '')));
+    if (ids.length === 0) break; // página sem cards => terminou
+  }
+
+  await browser.close();
+  return Array.from(seen).slice(0, max);
+}
+
+// Abre a página do produto e extrai título/preço/vendidos/permalink via DOM/JSON-LD
+async function headlessFetchItems(ids) {
+  const browser = await puppeteer.launch({
+    args: ['--no-sandbox','--disable-setuid-sandbox'],
+    headless: 'new'
+  });
+
+  const out = [];
+  const pool = Math.min(4, ids.length);
+  let idx = 0;
+
+  async function worker() {
+    while (idx < ids.length) {
+      const id = ids[idx++];
+      const url = `https://produto.mercadolivre.com.br/${id}`;
+      const p = await browser.newPage();
+      try {
+        await p.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36');
+        await p.setExtraHTTPHeaders({ 'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8' });
+        await p.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+
+        const data = await p.evaluate(() => {
+          // tenta JSON-LD
+          const ld = Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
+            .map(s => { try { return JSON.parse(s.textContent || 'null'); } catch { return null; } })
+            .flatMap(x => Array.isArray(x) ? x : [x])
+            .filter(x => x && (x['@type'] === 'Product' || (Array.isArray(x['@type']) && x['@type'].includes('Product'))));
+
+          let title = '', price = null, permalink = '', sold_quantity = null;
+
+          for (const obj of ld) {
+            title ||= obj.name || '';
+            const offers = Array.isArray(obj.offers) ? obj.offers[0] : obj.offers;
+            const p = offers?.price ?? offers?.priceSpecification?.price;
+            if (p != null) {
+              const pn = Number(String(p).replace(/[^\d.,-]/g,'').replace('.', '').replace(',', '.'));
+              if (!Number.isNaN(pn)) price = pn;
+            }
+            permalink ||= obj.url || '';
+          }
+
+          if (!permalink) {
+            const can = document.querySelector('link[rel="canonical"]')?.href;
+            if (can) permalink = can;
+          }
+          if (!title) {
+            title = document.querySelector('h1')?.textContent?.trim() ||
+                    document.querySelector('meta[property="og:title"]')?.getAttribute('content') || '';
+          }
+          if (!price) {
+            const frac = document.querySelector('.andes-money-amount__fraction')?.textContent || '';
+            const dec = document.querySelector('.andes-money-amount__cents')?.textContent || '';
+            const raw = (frac ? frac : '') + (dec ? ',' + dec : '');
+            const pn = Number(raw.replace(/\./g,'').replace(',','.'));
+            if (!Number.isNaN(pn)) price = pn;
+          }
+          if (!sold_quantity) {
+            const sold = Array.from(document.querySelectorAll('span, small'))
+              .map(e => e.textContent || '')
+              .find(t => /vendid/i.test(t));
+            if (sold) {
+              const n = parseInt(sold.replace(/[^\d]/g,''), 10);
+              if (!Number.isNaN(n)) sold_quantity = n;
+            }
+          }
+          return { title, price, sold_quantity, permalink };
+        });
+
+        out.push({ id, ...data });
+      } catch {
+        out.push({ id, error: 'fetch_failed' });
+      } finally {
+        await p.close();
+      }
+    }
+  }
+
+  await Promise.all(Array.from({ length: pool }, () => worker()));
+  await browser.close();
+  return out;
+}
+
+
+// Concorrentes (scrape com navegador real): lista anúncios de um seller SEM usar a API
+app.get('/api/scrape2/seller/:sellerId', async (req, res) => {
+  try {
+    const sellerId = req.params.sellerId;
+    const max = Math.min(parseInt(req.query.max || '100', 10), 200);
+    if (!/^\d{6,}$/.test(sellerId)) return res.status(400).json({ error: 'invalid_seller_id' });
+
+    const ids = await headlessCollectIds(sellerId, max);
+    if (!ids.length) return res.json([]); // igual planilha: vazio sem erro
+
+    const items = await headlessFetchItems(ids);
+    res.json(items);
+  } catch (e) {
+    console.error('scrape2 error', e?.response?.status, e?.response?.data || e.message);
+    res.status(500).json({ error: 'scrape2_failed', detail: e?.response?.data || e.message });
+  }
+});
 
 // Error handler
 app.use((err, req, res, next) => { console.error('Unhandled error:', err); res.status(500).send('Server error'); });

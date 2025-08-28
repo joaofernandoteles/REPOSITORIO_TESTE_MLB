@@ -43,12 +43,23 @@ function canonicalMlbId(s) {
 
 function extractIdsFromHtml(html) {
   const ids = new Set();
-  const re = /MLB-?\d{6,}/g;
+
+  // IDs em texto
+  const re1 = /MLB-?\d{6,}/g;
   let m;
-  while ((m = re.exec(html))) {
+  while ((m = re1.exec(html))) {
     const id = canonicalMlbId(m[0]);
     if (id) ids.add(id);
   }
+
+  // IDs em JSON: "id":"MLB123..."
+  const re2 = /"id"\s*:\s*"MLB(\d{6,})"/g;
+  while ((m = re2.exec(html))) ids.add('MLB' + m[1]);
+
+  // IDs em JSON por permalink: "permalink":"https://.../MLB123..."
+  const re3 = /"permalink"\s*:\s*"https?:\/\/[^"]*\/(MLB\d{6,})/g;
+  while ((m = re3.exec(html))) ids.add(m[1]);
+
   return Array.from(ids);
 }
 

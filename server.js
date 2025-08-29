@@ -7,9 +7,9 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import cookieSession from 'cookie-session';
 import crypto from 'crypto';
-import {install, detectBrowserPlatform, Browser, resolveBuildId, computeExecutablePath} from '@puppeteer/browsers';
+import { install, detectBrowserPlatform, Browser, resolveBuildId, computeExecutablePath } from '@puppeteer/browsers';
 import fs from 'fs';
-import os from 'os';
+import puppeteer from 'puppeteer';
 
 dotenv.config();
 const __filename = fileURLToPath(import.meta.url);
@@ -28,7 +28,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 // Headers p/ parecer navegador
 const UA_HEADERS = {
-  'User-Agent': 'Mozilla/5.0 ...',
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36',
   'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8',
   'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
   'Referer': 'https://lista.mercadolivre.com.br/'
@@ -163,7 +163,6 @@ async function fetchSellerViaApi(req, sellerId, max = 100) {
   let offset = 0;
   const all = [];
 
-  // tenta obter token de usuário; se não tiver, segue sem (tentará app token)
   let userToken = null;
   try { userToken = await refreshIfNeeded(req); } catch (_) { }
 
@@ -173,44 +172,39 @@ async function fetchSellerViaApi(req, sellerId, max = 100) {
     const baseParams = { seller_id: sellerId, limit, offset };
 
     let data = null;
-    let lastErr = null;
 
     // 1) tenta com token de USUÁRIO (header + query)
     if (userToken) {
       try {
         const r = await axios.get(url, {
           params: { ...baseParams, access_token: userToken },
-          headers: { 'Accept': 'application/json', 'Authorization': `Bearer ${userToken}` },
+          headers: {
+            'Accept': 'application/json',
+            'Authorization': `Bearer ${userToken}`,
+            'X-Caller-Id': X_CALLER
+          },
           timeout: 20000
         });
         data = r.data;
       } catch (e) {
-        lastErr = e;
         const s = e.response?.status;
-        // se não for erro de auth, propaga
         if (s !== 401 && s !== 403) throw e;
       }
     }
 
     // 2) se falhou/sem dados, tenta APP TOKEN (client_credentials)
     if (!data) {
-      const appTok = await getAppToken(req); // usa credenciais da sessão ou das env vars (se você adicionou)
-      try {
-        const r2 = await axios.get(url, {
-          params: { ...baseParams, access_token: appTok },
-          headers: {
-            'Accept': 'application/json',
-            'Authorization': `Bearer ${userToken}`,     // ou appTok, no outro bloco
-            'X-Caller-Id': X_CALLER
-          },
-          timeout: 20000
-        });
-        data = r2.data;
-      } catch (e2) {
-        // log para debug e propaga
-        console.error('fetchSellerViaApi fail', e2.response?.status, e2.response?.data || e2.message);
-        throw e2;
-      }
+      const appTok = await getAppToken(req);
+      const r2 = await axios.get(url, {
+        params: { ...baseParams, access_token: appTok },
+        headers: {
+          'Accept': 'application/json',
+          'Authorization': `Bearer ${appTok}`,   // <- CORRIGIDO
+          'X-Caller-Id': X_CALLER
+        },
+        timeout: 20000
+      });
+      data = r2.data;
     }
 
     const arr = data?.results || [];
@@ -219,7 +213,6 @@ async function fetchSellerViaApi(req, sellerId, max = 100) {
     offset += arr.length;
   }
 
-  // normaliza para o formato do "Passo 8"
   return all.map(x => ({
     id: x.id,
     title: x.title,
@@ -228,8 +221,6 @@ async function fetchSellerViaApi(req, sellerId, max = 100) {
     permalink: x.permalink
   }));
 }
-
-
 
 
 // --- cookie session por usuário ---
@@ -342,11 +333,9 @@ async function meliGET(req, endpoint, { params = {}, auth = false } = {}) {
         try {
           const appToken = await getAppToken(req);
           headers['Authorization'] = `Bearer ${appToken}`;
-          // tenta de novo já com Authorization
+          headers['X-Caller-Id'] = getCreds(req)?.client_id || process.env.APP_CLIENT_ID || process.env.CLIENT_ID || '';
           continue;
-        } catch (_) {
-          // se não conseguiu app token, cai para tratamento normal
-        }
+        } catch (_) { }
       }
 
       if (status === 429) { await new Promise(r => setTimeout(r, 1200 * (i + 1))); continue; }
@@ -659,8 +648,6 @@ app.get('/api/raw/sites-search', async (req, res) => {
   }
 });
 
-import puppeteer from 'puppeteer';
-
 
 // Garante um Chromium disponível em runtime (Render) baixando para /tmp/puppeteer
 async function ensureChromiumPath() {
@@ -672,7 +659,7 @@ async function ensureChromiumPath() {
   try {
     const p = puppeteer.executablePath();
     if (p && fs.existsSync(p)) return p;
-  } catch {}
+  } catch { }
 
   // 3) baixa agora com @puppeteer/browsers para /tmp (gravável no Render)
   const cacheDir = process.env.PUPPETEER_CACHE_DIR || '/tmp/puppeteer';
@@ -693,7 +680,7 @@ async function ensureChromiumPath() {
 // Renderiza a vitrine do seller como um navegador real e coleta IDs (MLB...)
 async function headlessCollectIds(sellerId, max = 120) {
   const browser = await puppeteer.launch({
-    executablePath: puppeteer.executablePath(),      // 👈 garante caminho certo
+    executablePath: await ensureChromiumPath(),
     headless: 'new',
     args: ['--no-sandbox', '--disable-setuid-sandbox']
   });
@@ -734,8 +721,9 @@ async function headlessCollectIds(sellerId, max = 120) {
 // Abre a página do produto e extrai título/preço/vendidos/permalink via DOM/JSON-LD
 async function headlessFetchItems(ids) {
   const browser = await puppeteer.launch({
-    args: ['--no-sandbox', '--disable-setuid-sandbox'],
-    headless: 'new'
+    executablePath: await ensureChromiumPath(), // <- corrigido
+    headless: 'new',
+    args: ['--no-sandbox', '--disable-setuid-sandbox']
   });
 
   const out = [];

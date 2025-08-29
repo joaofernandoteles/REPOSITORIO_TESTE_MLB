@@ -651,112 +651,118 @@ app.get('/api/raw/sites-search', async (req, res) => {
 
 let __CHROME_PATH_PROMISE = null;
 
-// Garante um Chromium em /tmp e reusa entre chamadas
 async function ensureChromiumPath() {
   if (__CHROME_PATH_PROMISE) return __CHROME_PATH_PROMISE;
   __CHROME_PATH_PROMISE = (async () => {
-    // 1) Se já houver caminho definido e existir, use
     if (process.env.PUPPETEER_EXECUTABLE_PATH && fs.existsSync(process.env.PUPPETEER_EXECUTABLE_PATH)) {
       return process.env.PUPPETEER_EXECUTABLE_PATH;
     }
-    // 2) Tente o executável padrão do puppeteer (se houver)
     try {
       const p = puppeteer.executablePath();
       if (p && fs.existsSync(p)) return p;
-    } catch { }
+    } catch {}
 
-    // 3) Baixe agora com @puppeteer/browsers para /tmp (gravável no Render)
     const cacheDir = process.env.PUPPETEER_CACHE_DIR || '/tmp/puppeteer';
     fs.mkdirSync(cacheDir, { recursive: true });
 
     const platform = detectBrowserPlatform();
-    const buildId = await resolveBuildId(Browser.CHROMIUM, platform, 'latest'); // 👈 'latest'
+    const buildId = await resolveBuildId(Browser.CHROMIUM, platform, 'latest'); // <- latest
 
     await install({ cacheDir, browser: Browser.CHROMIUM, platform, buildId });
     const execPath = computeExecutablePath({ cacheDir, browser: Browser.CHROMIUM, platform, buildId });
 
-    process.env.PUPPETEER_EXECUTABLE_PATH = execPath; // fixa para os próximos launches
+    process.env.PUPPETEER_EXECUTABLE_PATH = execPath;
     return execPath;
   })();
-
   return __CHROME_PATH_PROMISE;
 }
 
-
-// Renderiza a vitrine do seller como um navegador real e coleta IDs (MLB...)
 async function headlessCollectIds(sellerId, max = 120) {
+  const profileDir = fs.mkdtempSync(path.join('/tmp/', 'pupp_collect_')); // perfil único
+
   const browser = await puppeteer.launch({
     executablePath: await ensureChromiumPath(),
     headless: 'new',
     args: [
       '--no-sandbox', '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu', '--no-first-run', '--no-zygote',
+      '--disable-dev-shm-usage', '--disable-gpu',
+      '--no-first-run', '--no-zygote',
       '--disable-background-networking',
       '--disable-features=site-per-process,Translate,BackForwardCache',
-      '--user-data-dir=/tmp/pupp_profile_collect'
+      `--user-data-dir=${profileDir}`
+      // se ainda travar: adicione '--single-process'
     ]
   });
 
-  const pageSize = 50;
-  const seen = new Set();
+  let page;
+  try {
+    page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36');
+    await page.setExtraHTTPHeaders({ 'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8' });
 
-  for (let offset = 0; seen.size < max && offset < 600; offset += pageSize) {
-    const url = offset === 0
-      ? `https://lista.mercadolivre.com.br/_CustId_${sellerId}`
-      : `https://lista.mercadolivre.com.br/_CustId_${sellerId}_Desde_${offset + 1}`;
+    const pageSize = 50;
+    const seen = new Set();
 
-    await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
-    // dá um tempinho pra UI montar
-    await page.waitForTimeout(1500);
+    for (let offset = 0; seen.size < max && offset < 600; offset += pageSize) {
+      const url = offset === 0
+        ? `https://lista.mercadolivre.com.br/_CustId_${sellerId}`
+        : `https://lista.mercadolivre.com.br/_CustId_${sellerId}_Desde_${offset + 1}`;
 
-    const ids = await page.$$eval('a[href*="/MLB-"], a[href*="/MLB"]', as =>
-      Array.from(new Set(
-        as.map(a => (a.getAttribute('href') || '')
-          .match(/\/(MLB-?\d{6,})/i)?.[1])
-          .filter(Boolean)
-      ))
-    );
+      await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
+      await page.waitForTimeout(1500);
 
-    ids.forEach(raw => seen.add(raw.replace('-', '')));
-    if (ids.length === 0) break; // página sem cards => terminou
+      const ids = await page.$$eval('a[href*="/MLB-"], a[href*="/MLB"]', as =>
+        Array.from(new Set(
+          as.map(a => (a.getAttribute('href') || '')
+            .match(/\/(MLB-?\d{6,})/i)?.[1])
+            .filter(Boolean)
+        ))
+      );
+
+      ids.forEach(raw => seen.add(raw.replace('-', '')));
+      if (ids.length === 0) break;
+    }
+
+    return Array.from(seen).slice(0, max);
+  } finally {
+    if (page) { try { await page.close(); } catch {} }
+    try { await browser.close(); } catch {}
   }
-
-  await browser.close();
-  return Array.from(seen).slice(0, max);
 }
 
 // Abre a página do produto e extrai título/preço/vendidos/permalink via DOM/JSON-LD
 async function headlessFetchItems(ids) {
+  const profileDir = fs.mkdtempSync(path.join('/tmp/', 'pupp_fetch_')); // perfil único
+
   const browser = await puppeteer.launch({
-    executablePath: await ensureChromiumPath(),   // 👈 sem typo!
+    executablePath: await ensureChromiumPath(), // <- nome correto
     headless: 'new',
     args: [
       '--no-sandbox', '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu', '--no-first-run', '--no-zygote',
+      '--disable-dev-shm-usage', '--disable-gpu',
+      '--no-first-run', '--no-zygote',
       '--disable-background-networking',
       '--disable-features=site-per-process,Translate,BackForwardCache',
-      '--user-data-dir=/tmp/pupp_profile_fetch'
+      `--user-data-dir=${profileDir}`
     ]
   });
 
   const out = [];
-  const pool = Math.min(4, ids.length);
+  const pool = Math.min(3, ids.length); // um pouco mais conservador
   let idx = 0;
 
   async function worker() {
     while (idx < ids.length) {
       const id = ids[idx++];
       const url = `https://produto.mercadolivre.com.br/${id}`;
-      const p = await browser.newPage();
+      let p;
       try {
+        p = await browser.newPage();
         await p.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36');
         await p.setExtraHTTPHeaders({ 'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8' });
         await p.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
 
         const data = await p.evaluate(() => {
-          // tenta JSON-LD
           const ld = Array.from(document.querySelectorAll('script[type="application/ld+json"]'))
             .map(s => { try { return JSON.parse(s.textContent || 'null'); } catch { return null; } })
             .flatMap(x => Array.isArray(x) ? x : [x])
@@ -769,7 +775,7 @@ async function headlessFetchItems(ids) {
             const offers = Array.isArray(obj.offers) ? obj.offers[0] : obj.offers;
             const p = offers?.price ?? offers?.priceSpecification?.price;
             if (p != null) {
-              const pn = Number(String(p).replace(/[^\d.,-]/g, '').replace('.', '').replace(',', '.'));
+              const pn = Number(String(p).replace(/[^\d.,-]/g,'').replace('.', '').replace(',', '.'));
               if (!Number.isNaN(pn)) price = pn;
             }
             permalink ||= obj.url || '';
@@ -780,14 +786,14 @@ async function headlessFetchItems(ids) {
             if (can) permalink = can;
           }
           if (!title) {
-            title = document.querySelector('h1')?.textContent?.trim() ||
-              document.querySelector('meta[property="og:title"]')?.getAttribute('content') || '';
+            title = document.querySelector('h1')?.textContent?.trim()
+              || document.querySelector('meta[property="og:title"]')?.getAttribute('content') || '';
           }
           if (!price) {
             const frac = document.querySelector('.andes-money-amount__fraction')?.textContent || '';
-            const dec = document.querySelector('.andes-money-amount__cents')?.textContent || '';
-            const raw = (frac ? frac : '') + (dec ? ',' + dec : '');
-            const pn = Number(raw.replace(/\./g, '').replace(',', '.'));
+            const dec  = document.querySelector('.andes-money-amount__cents')?.textContent || '';
+            const raw  = (frac ? frac : '') + (dec ? ',' + dec : '');
+            const pn   = Number(raw.replace(/\./g,'').replace(',','.'));
             if (!Number.isNaN(pn)) price = pn;
           }
           if (!sold_quantity) {
@@ -795,7 +801,7 @@ async function headlessFetchItems(ids) {
               .map(e => e.textContent || '')
               .find(t => /vendid/i.test(t));
             if (sold) {
-              const n = parseInt(sold.replace(/[^\d]/g, ''), 10);
+              const n = parseInt(sold.replace(/[^\d]/g,''), 10);
               if (!Number.isNaN(n)) sold_quantity = n;
             }
           }
@@ -806,15 +812,19 @@ async function headlessFetchItems(ids) {
       } catch {
         out.push({ id, error: 'fetch_failed' });
       } finally {
-        await p.close();
+        if (p) { try { await p.close(); } catch {} }
       }
     }
   }
 
-  await Promise.all(Array.from({ length: pool }, () => worker()));
-  await browser.close();
+  try {
+    await Promise.all(Array.from({ length: pool }, () => worker()));
+  } finally {
+    try { await browser.close(); } catch {}
+  }
   return out;
 }
+
 
 
 // Concorrentes (scrape com navegador real): lista anúncios de um seller SEM usar a API

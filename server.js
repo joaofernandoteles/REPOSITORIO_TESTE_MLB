@@ -681,20 +681,21 @@ async function ensureChromiumPath() {
 }
 
 async function headlessCollectIds(sellerId, max = 120) {
-  const profileDir = fs.mkdtempSync(path.join('/tmp/', 'pupp_collect_')); // perfil único
+  const profileDir = fs.mkdtempSync(path.join('/tmp/', 'pupp_collect_'));
 
   const browser = await puppeteer.launch({
     executablePath: await ensureChromiumPath(),
     headless: 'new',
     args: [
-      '--no-sandbox', '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage', '--disable-gpu',
-      '--no-first-run', '--no-zygote',
+      '--no-sandbox','--disable-setuid-sandbox',
+      '--disable-dev-shm-usage','--disable-gpu',
+      '--no-first-run','--no-zygote',
       '--disable-background-networking',
       '--disable-features=site-per-process,Translate,BackForwardCache',
       `--user-data-dir=${profileDir}`
-      // se ainda travar: adicione '--single-process'
-    ]
+      // se ainda travar: '--single-process'
+    ],
+    defaultViewport: { width: 1280, height: 1024 }
   });
 
   let page;
@@ -702,6 +703,14 @@ async function headlessCollectIds(sellerId, max = 120) {
     page = await browser.newPage();
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36');
     await page.setExtraHTTPHeaders({ 'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8' });
+
+    // bloqueia recursos pesados
+    await page.setRequestInterception(true);
+    page.on('request', req => {
+      const t = req.resourceType();
+      if (['image','font','media','stylesheet'].includes(t)) req.abort();
+      else req.continue();
+    });
 
     const pageSize = 50;
     const seen = new Set();
@@ -711,25 +720,44 @@ async function headlessCollectIds(sellerId, max = 120) {
         ? `https://lista.mercadolivre.com.br/_CustId_${sellerId}`
         : `https://lista.mercadolivre.com.br/_CustId_${sellerId}_Desde_${offset + 1}`;
 
-      await page.goto(url, { waitUntil: ['domcontentloaded', 'networkidle0'], timeout: 60000 });
-      await sleep(1500);
+      await page.goto(url, { waitUntil: ['domcontentloaded','networkidle0'], timeout: 60000 });
+      await page.waitForSelector('body', { timeout: 10000 }).catch(()=>{});
+      await sleep(1200);
 
-      const ids = await page.$$eval('a[href*="/MLB-"], a[href*="/MLB"]', as =>
+      // 1) pelos links
+      const viaAnchors = await page.$$eval('a[href*="MLB"]', as =>
         Array.from(new Set(
           as.map(a => (a.getAttribute('href') || '')
-            .match(/\/(MLB-?\d{6,})/i)?.[1])
-            .filter(Boolean)
+            .match(/(MLB-?\d{6,})/i)?.[1])
+          .filter(Boolean)
+          .map(s => s.replace('-', ''))
         ))
       );
 
-      ids.forEach(raw => seen.add(raw.replace('-', '')));
-      if (ids.length === 0) break;
+      // 2) por scripts em linha (JSON embutido)
+      const viaScripts = await page.evaluate(() => {
+        const txt = Array.from(document.scripts).map(s => s.textContent || '').join('\n');
+        const m = txt.match(/MLB-?\d{6,}/g) || [];
+        return Array.from(new Set(m.map(s => s.replace('-', ''))));
+      });
+
+      // 3) pelo HTML renderizado completo
+      const viaHtml = await page.evaluate(() => {
+        const html = document.documentElement.innerHTML;
+        const m = html.match(/MLB-?\d{6,}/g) || [];
+        return Array.from(new Set(m.map(s => s.replace('-', ''))));
+      });
+
+      [...viaAnchors, ...viaScripts, ...viaHtml].forEach(id => seen.add(id));
+
+      // se essa página não trouxe nada, provavelmente acabou
+      if (viaAnchors.length + viaScripts.length + viaHtml.length === 0) break;
     }
 
     return Array.from(seen).slice(0, max);
   } finally {
-    if (page) { try { await page.close(); } catch { } }
-    try { await browser.close(); } catch { }
+    if (page) { try { await page.close(); } catch {} }
+    try { await browser.close(); } catch {}
   }
 }
 

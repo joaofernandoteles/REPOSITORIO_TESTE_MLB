@@ -244,7 +244,7 @@ const setTokens = (req, tokens) => req.session.tokens = tokens;
 const clearSession = req => req.session = null;
 const sleep = (ms) => new Promise(res => setTimeout(res, ms));
 
-async function autoScroll(page, steps = 8, gap = 600) {
+async function autoScroll(page, steps = 12, gap = 500) {
   for (let i = 0; i < steps; i++) {
     await page.evaluate(() => window.scrollBy(0, window.innerHeight * 0.9));
     await sleep(gap);
@@ -707,12 +707,13 @@ async function headlessCollectIds(sellerId, max = 120) {
     executablePath: await ensureChromiumPath(),
     headless: 'new',
     args: [
-      '--no-sandbox', '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage', '--disable-gpu',
-      '--no-first-run', '--no-zygote',
+      '--no-sandbox','--disable-setuid-sandbox',
+      '--disable-dev-shm-usage','--disable-gpu',
+      '--no-first-run','--no-zygote',
       '--disable-background-networking',
       '--disable-features=site-per-process,Translate,BackForwardCache',
       `--user-data-dir=${profileDir}`
+      // se ainda travar: '--single-process'
     ],
     defaultViewport: { width: 1280, height: 1024 }
   });
@@ -722,12 +723,28 @@ async function headlessCollectIds(sellerId, max = 120) {
     page = await browser.newPage();
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36');
     await page.setExtraHTTPHeaders({ 'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8' });
+
+    // bloqueia recursos pesados
     await page.setRequestInterception(true);
     page.on('request', req => {
       const t = req.resourceType();
-      if (['image', 'font', 'media', 'stylesheet'].includes(t)) req.abort();
+      if (['image','font','media','stylesheet'].includes(t)) req.abort();
       else req.continue();
     });
+
+    // 🕵️ fareador de JSON das XHR/fetch responses
+    const sniffed = new Set();
+    page.on('response', async (res) => {
+      try {
+        const ct = (res.headers()['content-type'] || '').toLowerCase();
+        if (!ct.includes('application/json')) return;
+        const text = await res.text();
+        const m = text.match(/MLB-?\d{6,}/g) || [];
+        m.forEach(s => sniffed.add(s.replace('-', '')));
+      } catch {}
+    });
+
+    // tornar menos detectável
     await page.evaluateOnNewDocument(() => {
       Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
@@ -740,12 +757,12 @@ async function headlessCollectIds(sellerId, max = 120) {
         ? `https://lista.mercadolivre.com.br/_CustId_${sellerId}`
         : `https://lista.mercadolivre.com.br/_CustId_${sellerId}_Desde_${offset + 1}`;
 
-      await page.goto(url, { waitUntil: ['domcontentloaded', 'networkidle0'], timeout: 60000 });
+      await page.goto(url, { waitUntil: ['domcontentloaded','networkidle0'], timeout: 60000 });
       await maybeAcceptCookies(page);
-      await sleep(1200);               // dá tempo do JS montar
-      await autoScroll(page, 6, 400);  // força carregamento lazy
+      await sleep(1200);
+      await autoScroll(page, 10, 400); // força lazy-load
 
-      // 1) links
+      // 1) pelos links
       const viaAnchors = await page.$$eval('a[href*="MLB"]', as =>
         Array.from(new Set(
           as.map(a => (a.getAttribute('href') || '')
@@ -755,33 +772,37 @@ async function headlessCollectIds(sellerId, max = 120) {
         ))
       );
 
-      // 2) scripts (JSON embutido)
+      // 2) por scripts em linha
       const viaScripts = await page.evaluate(() => {
         const txt = Array.from(document.scripts).map(s => s.textContent || '').join('\n');
         const m = txt.match(/MLB-?\d{6,}/g) || [];
         return Array.from(new Set(m.map(s => s.replace('-', ''))));
       });
 
-      // 3) HTML renderizado
+      // 3) pelo HTML renderizado
       const viaHtml = await page.evaluate(() => {
         const html = document.documentElement.innerHTML;
         const m = html.match(/MLB-?\d{6,}/g) || [];
         return Array.from(new Set(m.map(s => s.replace('-', ''))));
       });
 
-      [...viaAnchors, ...viaScripts, ...viaHtml].forEach(id => seen.add(id));
-      const got = viaAnchors.length + viaScripts.length + viaHtml.length;
-      console.log(`[scrape2] page offset=${offset} ids=${got} unique=${seen.size}`);
+      // 4) pelos XHR/JSON capturados
+      const viaNet = Array.from(sniffed);
 
-      if (got === 0) break; // página sem nada: encerra
+      [...viaAnchors, ...viaScripts, ...viaHtml, ...viaNet].forEach(id => seen.add(id));
+      const got = viaAnchors.length + viaScripts.length + viaHtml.length + viaNet.length;
+      console.log(`[scrape2] page offset=${offset} viaAnchors=${viaAnchors.length} viaScripts=${viaScripts.length} viaHtml=${viaHtml.length} viaNet=${viaNet.length} unique=${seen.size}`);
+
+      if (got === 0) break;
     }
 
     return Array.from(seen).slice(0, max);
   } finally {
-    if (page) { try { await page.close(); } catch { } }
-    try { await browser.close(); } catch { }
+    if (page) { try { await page.close(); } catch {} }
+    try { await browser.close(); } catch {}
   }
 }
+
 
 
 async function headlessCollectIdsFromProfile(nickname, max = 120) {

@@ -242,6 +242,9 @@ const setCreds = (req, { client_id, client_secret, redirect_uri }) => req.sessio
 const getTokens = req => req.session?.tokens || null;
 const setTokens = (req, tokens) => req.session.tokens = tokens;
 const clearSession = req => req.session = null;
+const sleep = (ms) => new Promise(res => setTimeout(res, ms));
+
+
 
 // token da aplicação (client_credentials) para chamadas públicas
 async function getAppToken(req) {
@@ -660,7 +663,7 @@ async function ensureChromiumPath() {
     try {
       const p = puppeteer.executablePath();
       if (p && fs.existsSync(p)) return p;
-    } catch {}
+    } catch { }
 
     const cacheDir = process.env.PUPPETEER_CACHE_DIR || '/tmp/puppeteer';
     fs.mkdirSync(cacheDir, { recursive: true });
@@ -708,8 +711,8 @@ async function headlessCollectIds(sellerId, max = 120) {
         ? `https://lista.mercadolivre.com.br/_CustId_${sellerId}`
         : `https://lista.mercadolivre.com.br/_CustId_${sellerId}_Desde_${offset + 1}`;
 
-      await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 });
-      await page.waitForTimeout(1500);
+      await page.goto(url, { waitUntil: ['domcontentloaded', 'networkidle0'], timeout: 60000 });
+      await sleep(1500);
 
       const ids = await page.$$eval('a[href*="/MLB-"], a[href*="/MLB"]', as =>
         Array.from(new Set(
@@ -725,8 +728,8 @@ async function headlessCollectIds(sellerId, max = 120) {
 
     return Array.from(seen).slice(0, max);
   } finally {
-    if (page) { try { await page.close(); } catch {} }
-    try { await browser.close(); } catch {}
+    if (page) { try { await page.close(); } catch { } }
+    try { await browser.close(); } catch { }
   }
 }
 
@@ -775,7 +778,7 @@ async function headlessFetchItems(ids) {
             const offers = Array.isArray(obj.offers) ? obj.offers[0] : obj.offers;
             const p = offers?.price ?? offers?.priceSpecification?.price;
             if (p != null) {
-              const pn = Number(String(p).replace(/[^\d.,-]/g,'').replace('.', '').replace(',', '.'));
+              const pn = Number(String(p).replace(/[^\d.,-]/g, '').replace('.', '').replace(',', '.'));
               if (!Number.isNaN(pn)) price = pn;
             }
             permalink ||= obj.url || '';
@@ -791,9 +794,9 @@ async function headlessFetchItems(ids) {
           }
           if (!price) {
             const frac = document.querySelector('.andes-money-amount__fraction')?.textContent || '';
-            const dec  = document.querySelector('.andes-money-amount__cents')?.textContent || '';
-            const raw  = (frac ? frac : '') + (dec ? ',' + dec : '');
-            const pn   = Number(raw.replace(/\./g,'').replace(',','.'));
+            const dec = document.querySelector('.andes-money-amount__cents')?.textContent || '';
+            const raw = (frac ? frac : '') + (dec ? ',' + dec : '');
+            const pn = Number(raw.replace(/\./g, '').replace(',', '.'));
             if (!Number.isNaN(pn)) price = pn;
           }
           if (!sold_quantity) {
@@ -801,7 +804,7 @@ async function headlessFetchItems(ids) {
               .map(e => e.textContent || '')
               .find(t => /vendid/i.test(t));
             if (sold) {
-              const n = parseInt(sold.replace(/[^\d]/g,''), 10);
+              const n = parseInt(sold.replace(/[^\d]/g, ''), 10);
               if (!Number.isNaN(n)) sold_quantity = n;
             }
           }
@@ -812,7 +815,7 @@ async function headlessFetchItems(ids) {
       } catch {
         out.push({ id, error: 'fetch_failed' });
       } finally {
-        if (p) { try { await p.close(); } catch {} }
+        if (p) { try { await p.close(); } catch { } }
       }
     }
   }
@@ -820,7 +823,7 @@ async function headlessFetchItems(ids) {
   try {
     await Promise.all(Array.from({ length: pool }, () => worker()));
   } finally {
-    try { await browser.close(); } catch {}
+    try { await browser.close(); } catch { }
   }
   return out;
 }

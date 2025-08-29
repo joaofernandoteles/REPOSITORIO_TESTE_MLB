@@ -244,6 +244,26 @@ const setTokens = (req, tokens) => req.session.tokens = tokens;
 const clearSession = req => req.session = null;
 const sleep = (ms) => new Promise(res => setTimeout(res, ms));
 
+async function autoScroll(page, steps = 8, gap = 600) {
+  for (let i = 0; i < steps; i++) {
+    await page.evaluate(() => window.scrollBy(0, window.innerHeight * 0.9));
+    await sleep(gap);
+  }
+}
+
+async function maybeAcceptCookies(page) {
+  try {
+    const btns = await page.$$('button, [role="button"]');
+    for (const b of btns) {
+      const txt = ((await page.evaluate(el => el.textContent || '', b)) || '').toLowerCase();
+      if (txt.includes('entendi') || txt.includes('aceitar') || txt.includes('accept') || txt.includes('continuar')) {
+        await b.click({ delay: 30 });
+        await sleep(500);
+        break;
+      }
+    }
+  } catch { }
+}
 
 
 // token da aplicação (client_credentials) para chamadas públicas
@@ -687,13 +707,12 @@ async function headlessCollectIds(sellerId, max = 120) {
     executablePath: await ensureChromiumPath(),
     headless: 'new',
     args: [
-      '--no-sandbox','--disable-setuid-sandbox',
-      '--disable-dev-shm-usage','--disable-gpu',
-      '--no-first-run','--no-zygote',
+      '--no-sandbox', '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage', '--disable-gpu',
+      '--no-first-run', '--no-zygote',
       '--disable-background-networking',
       '--disable-features=site-per-process,Translate,BackForwardCache',
       `--user-data-dir=${profileDir}`
-      // se ainda travar: '--single-process'
     ],
     defaultViewport: { width: 1280, height: 1024 }
   });
@@ -703,13 +722,14 @@ async function headlessCollectIds(sellerId, max = 120) {
     page = await browser.newPage();
     await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36');
     await page.setExtraHTTPHeaders({ 'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8' });
-
-    // bloqueia recursos pesados
     await page.setRequestInterception(true);
     page.on('request', req => {
       const t = req.resourceType();
-      if (['image','font','media','stylesheet'].includes(t)) req.abort();
+      if (['image', 'font', 'media', 'stylesheet'].includes(t)) req.abort();
       else req.continue();
+    });
+    await page.evaluateOnNewDocument(() => {
+      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
     });
 
     const pageSize = 50;
@@ -720,28 +740,29 @@ async function headlessCollectIds(sellerId, max = 120) {
         ? `https://lista.mercadolivre.com.br/_CustId_${sellerId}`
         : `https://lista.mercadolivre.com.br/_CustId_${sellerId}_Desde_${offset + 1}`;
 
-      await page.goto(url, { waitUntil: ['domcontentloaded','networkidle0'], timeout: 60000 });
-      await page.waitForSelector('body', { timeout: 10000 }).catch(()=>{});
-      await sleep(1200);
+      await page.goto(url, { waitUntil: ['domcontentloaded', 'networkidle0'], timeout: 60000 });
+      await maybeAcceptCookies(page);
+      await sleep(1200);               // dá tempo do JS montar
+      await autoScroll(page, 6, 400);  // força carregamento lazy
 
-      // 1) pelos links
+      // 1) links
       const viaAnchors = await page.$$eval('a[href*="MLB"]', as =>
         Array.from(new Set(
           as.map(a => (a.getAttribute('href') || '')
             .match(/(MLB-?\d{6,})/i)?.[1])
-          .filter(Boolean)
-          .map(s => s.replace('-', ''))
+            .filter(Boolean)
+            .map(s => s.replace('-', ''))
         ))
       );
 
-      // 2) por scripts em linha (JSON embutido)
+      // 2) scripts (JSON embutido)
       const viaScripts = await page.evaluate(() => {
         const txt = Array.from(document.scripts).map(s => s.textContent || '').join('\n');
         const m = txt.match(/MLB-?\d{6,}/g) || [];
         return Array.from(new Set(m.map(s => s.replace('-', ''))));
       });
 
-      // 3) pelo HTML renderizado completo
+      // 3) HTML renderizado
       const viaHtml = await page.evaluate(() => {
         const html = document.documentElement.innerHTML;
         const m = html.match(/MLB-?\d{6,}/g) || [];
@@ -749,17 +770,60 @@ async function headlessCollectIds(sellerId, max = 120) {
       });
 
       [...viaAnchors, ...viaScripts, ...viaHtml].forEach(id => seen.add(id));
+      const got = viaAnchors.length + viaScripts.length + viaHtml.length;
+      console.log(`[scrape2] page offset=${offset} ids=${got} unique=${seen.size}`);
 
-      // se essa página não trouxe nada, provavelmente acabou
-      if (viaAnchors.length + viaScripts.length + viaHtml.length === 0) break;
+      if (got === 0) break; // página sem nada: encerra
     }
 
     return Array.from(seen).slice(0, max);
   } finally {
-    if (page) { try { await page.close(); } catch {} }
-    try { await browser.close(); } catch {}
+    if (page) { try { await page.close(); } catch { } }
+    try { await browser.close(); } catch { }
   }
 }
+
+
+async function headlessCollectIdsFromProfile(nickname, max = 120) {
+  const profileDir = fs.mkdtempSync(path.join('/tmp/', 'pupp_profile_'));
+  const browser = await puppeteer.launch({
+    executablePath: await ensureChromiumPath(),
+    headless: 'new',
+    args: [
+      '--no-sandbox', '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage', '--disable-gpu',
+      '--no-first-run', '--no-zygote',
+      '--disable-background-networking',
+      '--disable-features=site-per-process,Translate,BackForwardCache',
+      `--user-data-dir=${profileDir}`
+    ],
+    defaultViewport: { width: 1280, height: 1024 }
+  });
+
+  let page;
+  try {
+    page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36');
+    await page.setExtraHTTPHeaders({ 'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8' });
+    await page.goto(`https://www.mercadolivre.com.br/perfil/${encodeURIComponent(nickname)}#search`, { waitUntil: ['domcontentloaded', 'networkidle0'], timeout: 60000 });
+    await maybeAcceptCookies(page);
+    await sleep(1200);
+    await autoScroll(page, 8, 400);
+
+    const ids = await page.evaluate(() => {
+      const html = document.documentElement.innerHTML;
+      const m = html.match(/MLB-?\d{6,}/g) || [];
+      return Array.from(new Set(m.map(s => s.replace('-', ''))));
+    });
+
+    console.log(`[scrape2] perfil ${nickname} ids=${ids.length}`);
+    return ids.slice(0, max);
+  } finally {
+    if (page) { try { await page.close(); } catch { } }
+    try { await browser.close(); } catch { }
+  }
+}
+
 
 // Abre a página do produto e extrai título/preço/vendidos/permalink via DOM/JSON-LD
 async function headlessFetchItems(ids) {
@@ -865,8 +929,15 @@ app.get('/api/scrape2/seller/:sellerId', async (req, res) => {
     const max = Math.min(parseInt(req.query.max || '100', 10), 200);
     if (!/^\d{6,}$/.test(sellerId)) return res.status(400).json({ error: 'invalid_seller_id' });
 
-    const ids = await headlessCollectIds(sellerId, max);
-    if (!ids.length) return res.json([]); // igual planilha: vazio sem erro
+    let ids = await headlessCollectIds(sellerId, max);
+    if (!ids.length) {
+      // tenta descobrir nickname (usa seu token) e raspa o perfil
+      try {
+        const nick = await getSellerNickname(req, sellerId);
+        if (nick) ids = await headlessCollectIdsFromProfile(nick, max);
+      } catch { }
+    }
+    if (!ids.length) return res.json([]);
 
     const items = await headlessFetchItems(ids);
     res.json(items);

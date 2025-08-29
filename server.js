@@ -649,28 +649,37 @@ app.get('/api/raw/sites-search', async (req, res) => {
 });
 
 
-// Garante um Chromium disponível em runtime (Render) baixando para /tmp/puppeteer
+let __CHROME_PATH_PROMISE = null;
+
+// Garante um Chromium em /tmp e reusa entre chamadas
 async function ensureChromiumPath() {
-  if (process.env.PUPPETEER_EXECUTABLE_PATH && fs.existsSync(process.env.PUPPETEER_EXECUTABLE_PATH)) {
-    return process.env.PUPPETEER_EXECUTABLE_PATH;
-  }
-  try {
-    const p = puppeteer.executablePath();
-    if (p && fs.existsSync(p)) return p;
-  } catch {}
+  if (__CHROME_PATH_PROMISE) return __CHROME_PATH_PROMISE;
+  __CHROME_PATH_PROMISE = (async () => {
+    // 1) Se já houver caminho definido e existir, use
+    if (process.env.PUPPETEER_EXECUTABLE_PATH && fs.existsSync(process.env.PUPPETEER_EXECUTABLE_PATH)) {
+      return process.env.PUPPETEER_EXECUTABLE_PATH;
+    }
+    // 2) Tente o executável padrão do puppeteer (se houver)
+    try {
+      const p = puppeteer.executablePath();
+      if (p && fs.existsSync(p)) return p;
+    } catch { }
 
-  const cacheDir = process.env.PUPPETEER_CACHE_DIR || '/tmp/puppeteer';
-  fs.mkdirSync(cacheDir, { recursive: true });
+    // 3) Baixe agora com @puppeteer/browsers para /tmp (gravável no Render)
+    const cacheDir = process.env.PUPPETEER_CACHE_DIR || '/tmp/puppeteer';
+    fs.mkdirSync(cacheDir, { recursive: true });
 
-  const platform = detectBrowserPlatform();
-  // 👇 AQUI: 'latest' (NÃO 'stable')
-  const buildId = await resolveBuildId(Browser.CHROMIUM, platform, 'latest');
+    const platform = detectBrowserPlatform();
+    const buildId = await resolveBuildId(Browser.CHROMIUM, platform, 'latest'); // 👈 'latest'
 
-  await install({ cacheDir, browser: Browser.CHROMIUM, platform, buildId });
-  const execPath = computeExecutablePath({ cacheDir, browser: Browser.CHROMIUM, platform, buildId });
+    await install({ cacheDir, browser: Browser.CHROMIUM, platform, buildId });
+    const execPath = computeExecutablePath({ cacheDir, browser: Browser.CHROMIUM, platform, buildId });
 
-  process.env.PUPPETEER_EXECUTABLE_PATH = execPath;
-  return execPath;
+    process.env.PUPPETEER_EXECUTABLE_PATH = execPath; // fixa para os próximos launches
+    return execPath;
+  })();
+
+  return __CHROME_PATH_PROMISE;
 }
 
 
@@ -679,12 +688,14 @@ async function headlessCollectIds(sellerId, max = 120) {
   const browser = await puppeteer.launch({
     executablePath: await ensureChromiumPath(),
     headless: 'new',
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
-  });
-  const page = await browser.newPage();
-  await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36');
-  await page.setExtraHTTPHeaders({
-    'Accept-Language': 'pt-BR,pt;q=0.9,en;q=0.8'
+    args: [
+      '--no-sandbox', '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu', '--no-first-run', '--no-zygote',
+      '--disable-background-networking',
+      '--disable-features=site-per-process,Translate,BackForwardCache',
+      '--user-data-dir=/tmp/pupp_profile_collect'
+    ]
   });
 
   const pageSize = 50;
@@ -718,9 +729,16 @@ async function headlessCollectIds(sellerId, max = 120) {
 // Abre a página do produto e extrai título/preço/vendidos/permalink via DOM/JSON-LD
 async function headlessFetchItems(ids) {
   const browser = await puppeteer.launch({
-    executablePath: await ensureChromiumPath(),  // <- corrigido
+    executablePath: await ensureChromiumPath(),   // 👈 sem typo!
     headless: 'new',
-    args: ['--no-sandbox', '--disable-setuid-sandbox']
+    args: [
+      '--no-sandbox', '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu', '--no-first-run', '--no-zygote',
+      '--disable-background-networking',
+      '--disable-features=site-per-process,Translate,BackForwardCache',
+      '--user-data-dir=/tmp/pupp_profile_fetch'
+    ]
   });
 
   const out = [];
@@ -819,5 +837,9 @@ app.get('/api/scrape2/seller/:sellerId', async (req, res) => {
 
 // Error handler
 app.use((err, req, res, next) => { console.error('Unhandled error:', err); res.status(500).send('Server error'); });
+
+ensureChromiumPath()
+  .then(p => console.log('Chromium ready:', p))
+  .catch(e => console.error('Chromium prep failed:', e.message));
 
 app.listen(PORT, '0.0.0.0', () => console.log(`MLB Dashboard (multiuser) em http://localhost:${PORT} (prod=${IS_PROD})`));

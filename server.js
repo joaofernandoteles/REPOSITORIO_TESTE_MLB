@@ -651,27 +651,24 @@ app.get('/api/raw/sites-search', async (req, res) => {
 
 // Garante um Chromium disponível em runtime (Render) baixando para /tmp/puppeteer
 async function ensureChromiumPath() {
-  // 1) se já foi definido via env
   if (process.env.PUPPETEER_EXECUTABLE_PATH && fs.existsSync(process.env.PUPPETEER_EXECUTABLE_PATH)) {
     return process.env.PUPPETEER_EXECUTABLE_PATH;
   }
-  // 2) tenta caminho padrão do puppeteer (se já houver)
   try {
     const p = puppeteer.executablePath();
     if (p && fs.existsSync(p)) return p;
-  } catch { }
+  } catch {}
 
-  // 3) baixa agora com @puppeteer/browsers para /tmp (gravável no Render)
   const cacheDir = process.env.PUPPETEER_CACHE_DIR || '/tmp/puppeteer';
   fs.mkdirSync(cacheDir, { recursive: true });
 
   const platform = detectBrowserPlatform();
-  const buildId = await resolveBuildId(Browser.CHROMIUM, platform, 'stable');
+  // 👇 AQUI: 'latest' (NÃO 'stable')
+  const buildId = await resolveBuildId(Browser.CHROMIUM, platform, 'latest');
 
   await install({ cacheDir, browser: Browser.CHROMIUM, platform, buildId });
   const execPath = computeExecutablePath({ cacheDir, browser: Browser.CHROMIUM, platform, buildId });
 
-  // opcional: fixa em env para próximos launches
   process.env.PUPPETEER_EXECUTABLE_PATH = execPath;
   return execPath;
 }
@@ -721,7 +718,7 @@ async function headlessCollectIds(sellerId, max = 120) {
 // Abre a página do produto e extrai título/preço/vendidos/permalink via DOM/JSON-LD
 async function headlessFetchItems(ids) {
   const browser = await puppeteer.launch({
-    executablePath: await ensureChromiumPath(), // <- corrigido
+    executablePath: await ensureChromiumPath(),  // <- corrigido
     headless: 'new',
     args: ['--no-sandbox', '--disable-setuid-sandbox']
   });
